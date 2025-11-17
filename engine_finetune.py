@@ -84,7 +84,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 if model_ema is not None:
                     model_ema.update(model)
         
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
         if mixup_fn is None:
             class_acc = (output.max(-1)[-1] == targets).float().mean()
@@ -123,8 +123,87 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+# @torch.no_grad()
+# # def evaluate(data_loader, model, device, use_amp=False):
+# def evaluate(data_loader, model, device, use_amp=False, distributed=False):
+#     criterion = torch.nn.CrossEntropyLoss()
+
+#     metric_logger = utils.MetricLogger(delimiter="  ")
+#     header = 'Test:'
+
+#     # switch to evaluation mode
+#     model.eval()
+
+#     for index, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
+#         images = batch[0]
+#         target = batch[-1]
+
+#         images = images.to(device, non_blocking=True)
+#         target = target.to(device, non_blocking=True)
+
+#         # compute output
+#         if use_amp:
+#             with torch.cuda.amp.autocast(dytpe=torch.bfloat16):
+#                 output = model(images)
+#                 if isinstance(output, dict):
+#                     output = output['logits']
+#                 loss = criterion(output, target)
+#         else:
+#             output = model(images) #[bs, num_cls]
+#             if isinstance(output, dict):
+#                 output = output['logits']
+            
+#             loss = criterion(output, target)
+        
+#         if index == 0:
+#             predictions = output
+#             labels = target
+#         else:
+#             predictions = torch.cat((predictions, output), 0)
+#             labels = torch.cat((labels, target), 0)
+
+#         torch.cuda.synchronize()
+
+#         acc1, acc5 = accuracy(output, target, topk=(1, 2))
+
+#         batch_size = images.shape[0]
+#         metric_logger.update(loss=loss.item())
+#         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+#         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+#     # gather the stats from all processes
+#     metric_logger.synchronize_between_processes()
+#     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
+#           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+
+#     if distributed:
+#         output_ddp = [torch.zeros_like(predictions) for _ in range(utils.get_world_size())]
+#         dist.all_gather(output_ddp, predictions)
+#         labels_ddp = [torch.zeros_like(labels) for _ in range(utils.get_world_size())]
+#         dist.all_gather(labels_ddp, labels)
+
+#         output_all = torch.concat(output_ddp, dim=0)
+#         labels_all = torch.concat(labels_ddp, dim=0)
+    
+#     else:
+#         output_all = predictions
+#         labels_all = labels
+
+
+#     y_pred = softmax(output_all.detach().cpu().numpy(), axis=1)[:, 1]
+#     y_true = labels_all.detach().cpu().numpy()
+#     y_true = y_true.astype(int)
+    
+  
+#     acc = accuracy_score(y_true, y_pred > 0.5)
+#     ap = average_precision_score(y_true, y_pred)
+    
+   
+
+#     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap
+
+
 @torch.no_grad()
-def evaluate(data_loader, model, device, use_amp=False):
+def evaluate(data_loader, model, device, use_amp=False, distributed=False):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -161,7 +240,7 @@ def evaluate(data_loader, model, device, use_amp=False):
             predictions = torch.cat((predictions, output), 0)
             labels = torch.cat((labels, target), 0)
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchroni?ze()
 
         acc1, acc5 = accuracy(output, target, topk=(1, 2))
 
@@ -173,12 +252,41 @@ def evaluate(data_loader, model, device, use_amp=False):
     metric_logger.synchronize_between_processes()
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+    
+    # my code
+    if distributed:
+        output_ddp = [torch.zeros_like(predictions) for _ in range(utils.get_world_size())]
+        dist.all_gather(output_ddp, predictions)
+        labels_ddp = [torch.zeros_like(labels) for _ in range(utils.get_world_size())]
+        dist.all_gather(labels_ddp, labels)
+
+        output_all = torch.concat(output_ddp, dim=0)
+        labels_all = torch.concat(labels_ddp, dim=0)
+
+    else:
+        output_all = predictions
+        labels_all = labels
 
 
     output_ddp = [torch.zeros_like(predictions) for _ in range(utils.get_world_size())]
-    dist.all_gather(output_ddp, predictions)
+    # dist.all_gather(output_ddp, predictions)
+    
+    # my code for fixing error:
+    if utils.is_dist_avail_and_initialized():
+        dist.all_gather(output_ddp, predictions)
+    else:
+        output_ddp = [predictions]
+    # my code ends
+    
     labels_ddp = [torch.zeros_like(labels) for _ in range(utils.get_world_size())]
-    dist.all_gather(labels_ddp, labels)
+    # dist.all_gather(labels_ddp, labels)
+    
+    # my code to fix error
+    if utils.is_dist_avail_and_initialized():
+        dist.all_gather(labels_ddp, labels)
+    else:
+        labels_ddp = [labels]
+    # my code ends
 
     output_all = torch.concat(output_ddp, dim=0)
     labels_all = torch.concat(labels_ddp, dim=0)
@@ -188,10 +296,16 @@ def evaluate(data_loader, model, device, use_amp=False):
     y_true = labels_all.detach().cpu().numpy()
     y_true = y_true.astype(int)
     
+    # my code for printing predictions and ground truth 
+    # for i in range(0, len(y_true)):
+    #     print(y_pred[i], y_true[i])
   
     acc = accuracy_score(y_true, y_pred > 0.5)
     ap = average_precision_score(y_true, y_pred)
     
    
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap
+    # return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap
+    
+    # my code to return predictions and ground truths
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true
