@@ -296,3 +296,4 @@ def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
 
+
