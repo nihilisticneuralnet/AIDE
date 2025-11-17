@@ -597,7 +597,16 @@ class GradCAMAnalyzer:
                 cam, pred, conf = self.generate_gradcam(
                     input_tensor, branch='patchwise', sublayer_idx=idx
                 )
+                # DEBUG: Print CAM shape
+                print(f"CAM shape for {name}: {cam.shape}")
                 
+                # Ensure CAM is 2D
+                if len(cam.shape) == 3:
+                    cam = cam[:, :, 0]  # Take first channel if 3D
+                elif len(cam.shape) == 1:
+                    # Reshape if flattened
+                    h, w = original_img.shape[:2]
+                    cam = cam.reshape(h, w)
                 # Create visualization
                 visualization = show_cam_on_image(original_img, cam, use_rgb=True)
                 
@@ -620,6 +629,16 @@ class GradCAMAnalyzer:
             cam, pred, conf = self.generate_gradcam(
                 input_tensor, branch='semantic'
             )
+            # DEBUG: Print CAM shape
+            print(f"CAM shape for semantic: {cam.shape}")
+            
+            # Ensure CAM is 2D
+            if len(cam.shape) == 3:
+                cam = cam[:, :, 0]
+            elif len(cam.shape) == 1:
+                h, w = original_img.shape[:2]
+                cam = cam.reshape(h, w)
+              
             visualization = show_cam_on_image(original_img, cam, use_rgb=True)
             output_path = os.path.join(output_dir, f'{image_name}_semantic.png')
             Image.fromarray(visualization).save(output_path)
@@ -741,4 +760,5 @@ class GradCAMAnalyzer:
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
