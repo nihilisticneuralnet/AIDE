@@ -1,10 +1,15 @@
 import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 import torch
+import torch.nn.functional as F
 import clip
 import open_clip
 from .srm_filter_kernel import all_normalized_hpf_list
 import numpy as np
+import os
+from PIL import Image
+import cv2
+from tqdm import tqdm
 
 class HPF(nn.Module):
   def __init__(self):
@@ -204,6 +209,96 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         return x
 
+
+# ============================================================================
+# GRADCAM++ WRAPPER CLASS
+# ============================================================================
+class AIDEGradCAMWrapper(nn.Module):
+    """
+    Wrapper to make AIDE compatible with Grad-CAM++
+    Usage:
+        wrapper = AIDEGradCAMWrapper(aide_model, branch='patchwise', sublayer_idx=0)
+        target_layers = wrapper.get_target_layers()
+        cam = GradCAMPlusPlus(model=wrapper, target_layers=target_layers)
+    """
+    def __init__(self, aide_model, branch='patchwise', sublayer_idx=0):
+        super().__init__()
+        self.aide_model = aide_model
+        self.branch = branch
+        self.sublayer_idx = sublayer_idx  # 0=minmin, 1=maxmax, 2=minmin1, 3=maxmax1
+        
+    def get_target_layers(self):
+        """
+        Returns the target layers for Grad-CAM++
+        """
+        if self.branch == 'patchwise':
+            # Target the last bottleneck block of layer4 in ResNet
+            return [self.aide_model.model_min.layer4[-1]]
+        elif self.branch == 'semantic':
+            # Target the last block in the last stage of ConvNeXt
+            return [self.aide_model.openclip_convnext_xxl.stages[-1].blocks[-1]]
+        else:
+            raise ValueError(f"Unknown branch: {self.branch}. Use 'patchwise' or 'semantic'")
+        
+    def forward(self, x):
+        """
+        Forward pass for Grad-CAM++
+        Routes through the appropriate branch
+        """
+        b, t, c, h, w = x.shape
+        
+        if self.branch == 'patchwise':
+            # Extract the specific sublayer we want to visualize
+            x_layer = x[:, self.sublayer_idx]  # Shape: [b, c, h, w]
+            
+            # Apply HPF
+            x_layer = self.aide_model.hpf(x_layer)
+            
+            # Forward through ResNet layers
+            x_out = self.aide_model.model_min.conv1(x_layer)
+            x_out = self.aide_model.model_min.bn1(x_out)
+            x_out = self.aide_model.model_min.relu(x_out)
+            x_out = self.aide_model.model_min.maxpool(x_out)
+            
+            x_out = self.aide_model.model_min.layer1(x_out)
+            x_out = self.aide_model.model_min.layer2(x_out)
+            x_out = self.aide_model.model_min.layer3(x_out)
+            x_out = self.aide_model.model_min.layer4(x_out)  # This is where CAM will hook
+            
+            x_out = self.aide_model.model_min.avgpool(x_out)
+            x_out = x_out.view(x_out.size(0), -1)
+            
+            # Now complete the full forward pass for final classification
+            return self.aide_model(x)
+            
+        elif self.branch == 'semantic':
+            # For semantic branch, use the tokens (5th tensor)
+            tokens = x[:, 4]  # Shape: [b, c, h, w]
+            
+            # Apply ConvNeXt with proper normalization
+            clip_mean = torch.Tensor([0.48145466, 0.4578275, 0.40821073])
+            clip_mean = clip_mean.to(tokens.device, non_blocking=True).view(3, 1, 1)
+            clip_std = torch.Tensor([0.26862954, 0.26130258, 0.27577711])
+            clip_std = clip_std.to(tokens.device, non_blocking=True).view(3, 1, 1)
+            dinov2_mean = torch.Tensor([0.485, 0.456, 0.406]).to(tokens.device, non_blocking=True).view(3, 1, 1)
+            dinov2_std = torch.Tensor([0.229, 0.224, 0.225]).to(tokens.device, non_blocking=True).view(3, 1, 1)
+            
+            normalized_tokens = tokens * (dinov2_std / clip_std) + (dinov2_mean - clip_mean) / clip_std
+            
+            # Make this part require gradients for CAM
+            normalized_tokens.requires_grad_(True)
+            local_convnext_image_feats = self.aide_model.openclip_convnext_xxl(normalized_tokens)
+            
+            # Complete the forward pass
+            return self.aide_model(x)
+        
+        else:
+            raise ValueError(f"Unknown branch: {self.branch}")
+
+
+# ============================================================================
+# AIDE MODEL WITH GRADCAM++ SUPPORT
+# ============================================================================
 class AIDE_Model(nn.Module):
 
     def __init__(self, resnet_path, convnext_path):
@@ -213,7 +308,7 @@ class AIDE_Model(nn.Module):
         self.model_max = ResNet(Bottleneck, [3, 4, 6, 3])
        
         if resnet_path is not None:
-            pretrained_dict = torch.load(resnet_path, map_location='cpu')
+            pretrained_dict = torch.load(resnet_path, map_location='cpu', weights_only=False)
         
             model_min_dict = self.model_min.state_dict()
             model_max_dict = self.model_max.state_dict()
@@ -246,7 +341,39 @@ class AIDE_Model(nn.Module):
         for param in self.openclip_convnext_xxl.parameters():
             param.requires_grad = False
 
+    # ========================================================================
+    # GRADCAM++ METHODS
+    # ========================================================================
+    def get_target_layers(self, branch='patchwise'):
+        """
+        Returns target layers for Grad-CAM++ visualization
+        
+        Args:
+            branch: 'patchwise' for ResNet features or 'semantic' for ConvNeXt features
+            
+        Returns:
+            List of target layers for Grad-CAM++
+        """
+        if branch == 'patchwise':
+            return [self.model_min.layer4[-1]]
+        elif branch == 'semantic':
+            return [self.openclip_convnext_xxl.stages[-1].blocks[-1]]
+        else:
+            raise ValueError(f"Unknown branch: {branch}. Use 'patchwise' or 'semantic'")
     
+    def create_gradcam_wrapper(self, branch='patchwise', sublayer_idx=0):
+        """
+        Creates a wrapper for Grad-CAM++ visualization
+        
+        Args:
+            branch: 'patchwise' or 'semantic'
+            sublayer_idx: For patchwise - which sublayer to visualize
+                         0=minmin, 1=maxmax, 2=minmin1, 3=maxmax1
+                         
+        Returns:
+            AIDEGradCAMWrapper instance
+        """
+        return AIDEGradCAMWrapper(self, branch=branch, sublayer_idx=sublayer_idx)
 
     def forward(self, x):
 
@@ -285,6 +412,7 @@ class AIDE_Model(nn.Module):
         x_max1 = self.model_max(x_maxmax1)
 
         x_1 = (x_min + x_max + x_min1 + x_max1) / 4
+        x_0 *= 0
 
         x = torch.cat([x_0, x_1], dim=1)
 
@@ -292,8 +420,241 @@ class AIDE_Model(nn.Module):
 
         return x
 
+
+# ============================================================================
+# GRADCAM ANALYZER CLASS - INTEGRATED INTO THE SAME FILE
+# ============================================================================
+class GradCAMAnalyzer:
+    """
+    Complete Grad-CAM++ analyzer for AIDE model
+    This can be used with the main training/evaluation code
+    """
+    def __init__(self, model, device='cuda'):
+        """
+        Args:
+            model: AIDE_Model instance (already loaded with weights)
+            device: 'cuda' or 'cpu'
+        """
+        self.model = model
+        self.device = device
+        self.model.eval()
+        
+    def generate_gradcam(self, input_tensor, target_class=None, branch='patchwise', sublayer_idx=0):
+        """
+        Generate Grad-CAM++ heatmap
+        
+        Args:
+            input_tensor: Input tensor [1, 5, 3, H, W]
+            target_class: Target class for visualization (0 or 1)
+            branch: 'patchwise' or 'semantic'
+            sublayer_idx: Which sublayer to visualize (0-3)
+            
+        Returns:
+            grayscale_cam: Heatmap
+            pred_class: Predicted class
+            confidence: Prediction confidence
+        """
+        try:
+            from pytorch_grad_cam import GradCAMPlusPlus
+            from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+        except ImportError:
+            raise ImportError("Please install pytorch-grad-cam: pip install grad-cam")
+        
+        # Create wrapper
+        wrapper = self.model.create_gradcam_wrapper(branch=branch, sublayer_idx=sublayer_idx)
+        target_layers = wrapper.get_target_layers()
+        
+        # Initialize Grad-CAM++
+        cam = GradCAMPlusPlus(model=wrapper, target_layers=target_layers)
+        
+        # Get prediction
+        with torch.no_grad():
+            output = self.model(input_tensor)
+            probs = F.softmax(output, dim=1)
+            pred_class = torch.argmax(probs, dim=1).item()
+            confidence = probs[0, pred_class].item()
+        
+        # Generate CAM
+        if target_class is None:
+            target_class = pred_class
+            
+        targets = [ClassifierOutputTarget(target_class)]
+        grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
+        
+        return grayscale_cam[0], pred_class, confidence
+    
+    def visualize_all_branches(self, input_tensor, output_dir, image_name, true_label=None):
+        """
+        Generate Grad-CAM++ for all branches and sublayers
+        
+        Args:
+            input_tensor: Input tensor [1, 5, 3, H, W]
+            output_dir: Directory to save visualizations
+            image_name: Name for saving files
+            true_label: Ground truth label (optional)
+        """
+        try:
+            from pytorch_grad_cam.utils.image import show_cam_on_image
+        except ImportError:
+            raise ImportError("Please install pytorch-grad-cam: pip install grad-cam")
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Get original image for visualization (use the first sublayer)
+        original_img = input_tensor[0, 0].cpu().permute(1, 2, 0).numpy()
+        original_img = (original_img - original_img.min()) / (original_img.max() - original_img.min())
+        original_img = original_img.astype(np.float32)
+        
+        results = {}
+        
+        # Visualize patchwise branch (all 4 sublayers)
+        sublayer_names = ['minmin', 'maxmax', 'minmin1', 'maxmax1']
+        for idx, name in enumerate(sublayer_names):
+            try:
+                cam, pred, conf = self.generate_gradcam(
+                    input_tensor, branch='patchwise', sublayer_idx=idx
+                )
+                
+                # Create visualization
+                visualization = show_cam_on_image(original_img, cam, use_rgb=True)
+                
+                # Save
+                output_path = os.path.join(output_dir, f'{image_name}_patchwise_{name}.png')
+                Image.fromarray(visualization).save(output_path)
+                
+                results[f'patchwise_{name}'] = {
+                    'cam': cam,
+                    'pred': pred,
+                    'confidence': conf,
+                    'path': output_path
+                }
+                print(f"Saved: {output_path}")
+            except Exception as e:
+                print(f"Error generating CAM for {name}: {e}")
+        
+        # Visualize semantic branch
+        try:
+            cam, pred, conf = self.generate_gradcam(
+                input_tensor, branch='semantic'
+            )
+            visualization = show_cam_on_image(original_img, cam, use_rgb=True)
+            output_path = os.path.join(output_dir, f'{image_name}_semantic.png')
+            Image.fromarray(visualization).save(output_path)
+            
+            results['semantic'] = {
+                'cam': cam,
+                'pred': pred,
+                'confidence': conf,
+                'path': output_path
+            }
+            print(f"Saved: {output_path}")
+        except Exception as e:
+            print(f"Error generating semantic CAM: {e}")
+        
+        # Save original image
+        original_save_path = os.path.join(output_dir, f'{image_name}_original.png')
+        Image.fromarray((original_img * 255).astype(np.uint8)).save(original_save_path)
+        
+        return results
+    
+    def analyze_dataset(self, data_loader, output_root, max_samples=100, save_fp_fn=True):
+        """
+        Analyze dataset and generate Grad-CAMs for interesting cases
+        
+        Args:
+            data_loader: DataLoader for the dataset
+            output_root: Root directory for saving results
+            max_samples: Maximum number of samples to analyze
+            save_fp_fn: Whether to save False Positives and False Negatives
+        """
+        os.makedirs(output_root, exist_ok=True)
+        
+        fp_samples = []  # False positives
+        fn_samples = []  # False negatives
+        tp_samples = []  # True positives
+        tn_samples = []  # True negatives
+        
+        print("Analyzing dataset...")
+        for idx, batch in enumerate(tqdm(data_loader)):
+            if idx >= max_samples:
+                break
+            
+            if len(batch) == 2:
+                images, labels = batch
+            else:
+                images = batch[0]
+                labels = batch[1] if len(batch) > 1 else None
+                
+            images = images.to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model(images)
+                preds = torch.argmax(outputs, dim=1)
+            
+            if labels is not None:
+                for i in range(len(images)):
+                    pred = preds[i].item()
+                    true_label = labels[i].item()
+                    
+                    # Categorize
+                    if pred == 1 and true_label == 0:
+                        fp_samples.append((idx, i, images[i:i+1], true_label))
+                    elif pred == 0 and true_label == 1:
+                        fn_samples.append((idx, i, images[i:i+1], true_label))
+                    elif pred == 1 and true_label == 1:
+                        tp_samples.append((idx, i, images[i:i+1], true_label))
+                    else:
+                        tn_samples.append((idx, i, images[i:i+1], true_label))
+        
+        print(f"\nDataset Statistics:")
+        print(f"False Positives: {len(fp_samples)}")
+        print(f"False Negatives: {len(fn_samples)}")
+        print(f"True Positives: {len(tp_samples)}")
+        print(f"True Negatives: {len(tn_samples)}")
+        
+        if save_fp_fn:
+            # Generate Grad-CAMs for False Positives
+            print("\nGenerating Grad-CAMs for False Positives...")
+            fp_dir = os.path.join(output_root, 'false_positives')
+            for idx, (batch_idx, img_idx, img_tensor, true_label) in enumerate(fp_samples[:20]):
+                self.visualize_all_branches(
+                    img_tensor, 
+                    fp_dir, 
+                    f'FP_{idx}_batch{batch_idx}_img{img_idx}',
+                    true_label=true_label
+                )
+            
+            # Generate Grad-CAMs for False Negatives
+            print("\nGenerating Grad-CAMs for False Negatives...")
+            fn_dir = os.path.join(output_root, 'false_negatives')
+            for idx, (batch_idx, img_idx, img_tensor, true_label) in enumerate(fn_samples[:20]):
+                self.visualize_all_branches(
+                    img_tensor, 
+                    fn_dir, 
+                    f'FN_{idx}_batch{batch_idx}_img{img_idx}',
+                    true_label=true_label
+                )
+        
+        # Save statistics
+        stats = {
+            'fp': len(fp_samples),
+            'fn': len(fn_samples),
+            'tp': len(tp_samples),
+            'tn': len(tn_samples),
+            'total': len(fp_samples) + len(fn_samples) + len(tp_samples) + len(tn_samples),
+            'accuracy': (len(tp_samples) + len(tn_samples)) / (len(fp_samples) + len(fn_samples) + len(tp_samples) + len(tn_samples))
+        }
+        
+        import json
+        stats_path = os.path.join(output_root, 'analysis_stats.json')
+        with open(stats_path, 'w') as f:
+            json.dump(stats, f, indent=4)
+        
+        print(f"\nStatistics saved to: {stats_path}")
+        
+        return stats
+
+
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
-
-
