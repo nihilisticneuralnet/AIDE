@@ -246,6 +246,7 @@ class AIDEGradCAMWrapper(nn.Module):
         Routes through the appropriate branch
         """
         b, t, c, h, w = x.shape
+        print(f"Input requires_grad: {x.requires_grad}")
         
         if self.branch == 'patchwise':
             # Extract all sublayers
@@ -318,7 +319,7 @@ class AIDEGradCAMWrapper(nn.Module):
                 x_semantic = self.aide_model.convnext_proj(local_convnext_image_feats)
             
             # Zero out semantic (as per original AIDE forward)
-            x_semantic = x_semantic * 0
+            # x_semantic = x_semantic * 0
             
             # Combine and classify
             x_combined = torch.cat([x_semantic, x_patchwise], dim=1)  # [b, 256 + 2048]
@@ -521,21 +522,11 @@ class GradCAMAnalyzer:
         self.model = model
         self.device = device
         self.model.eval()
-        
+
+
     def generate_gradcam(self, input_tensor, target_class=None, branch='patchwise', sublayer_idx=0):
         """
         Generate Grad-CAM++ heatmap
-        
-        Args:
-            input_tensor: Input tensor [1, 5, 3, H, W]
-            target_class: Target class for visualization (0 or 1)
-            branch: 'patchwise' or 'semantic'
-            sublayer_idx: Which sublayer to visualize (0-3)
-            
-        Returns:
-            grayscale_cam: Heatmap
-            pred_class: Predicted class
-            confidence: Prediction confidence
         """
         try:
             from pytorch_grad_cam import GradCAMPlusPlus
@@ -543,28 +534,92 @@ class GradCAMAnalyzer:
         except ImportError:
             raise ImportError("Please install pytorch-grad-cam: pip install grad-cam")
         
+        # CRITICAL: Ensure input requires gradients
+        input_tensor = input_tensor.clone().detach().requires_grad_(True)
+        
         # Create wrapper
         wrapper = self.model.create_gradcam_wrapper(branch=branch, sublayer_idx=sublayer_idx)
         target_layers = wrapper.get_target_layers()
-        
-        # Initialize Grad-CAM++
-        cam = GradCAMPlusPlus(model=wrapper, target_layers=target_layers)
+        wrapper.eval()  # Eval mode
+        # But enable gradients for the input
+        input_tensor.requires_grad_(True)
+        # Initialize Grad-CAM++ with reshape_transform for proper handling
+        if branch == 'semantic':
+            # ConvNeXt outputs might need reshaping
+            cam = GradCAMPlusPlus(
+                model=wrapper, 
+                target_layers=target_layers
+            )
+        else:
+            cam = GradCAMPlusPlus(
+                model=wrapper, 
+                target_layers=target_layers
+            )
         
         # Get prediction
         with torch.no_grad():
-            output = self.model(input_tensor)
+            output = wrapper(input_tensor)
             probs = F.softmax(output, dim=1)
             pred_class = torch.argmax(probs, dim=1).item()
             confidence = probs[0, pred_class].item()
         
-        # Generate CAM
+        print(f"Prediction: {pred_class}, Confidence: {confidence:.4f}")
+        
+        # Generate CAM - use predicted class if not specified
         if target_class is None:
             target_class = pred_class
             
         targets = [ClassifierOutputTarget(target_class)]
-        grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
+        
+        # CRITICAL: Pass input tensor that requires grad
+        grayscale_cam = cam(input_tensor=input_tensor, targets=targets, eigen_smooth=True)
+        
+        print(f"CAM stats - Min: {grayscale_cam.min():.4f}, Max: {grayscale_cam.max():.4f}, Mean: {grayscale_cam.mean():.4f}")
         
         return grayscale_cam[0], pred_class, confidence
+    # def generate_gradcam(self, input_tensor, target_class=None, branch='patchwise', sublayer_idx=0):
+    #     """
+    #     Generate Grad-CAM++ heatmap
+        
+    #     Args:
+    #         input_tensor: Input tensor [1, 5, 3, H, W]
+    #         target_class: Target class for visualization (0 or 1)
+    #         branch: 'patchwise' or 'semantic'
+    #         sublayer_idx: Which sublayer to visualize (0-3)
+            
+    #     Returns:
+    #         grayscale_cam: Heatmap
+    #         pred_class: Predicted class
+    #         confidence: Prediction confidence
+    #     """
+    #     try:
+    #         from pytorch_grad_cam import GradCAMPlusPlus
+    #         from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+    #     except ImportError:
+    #         raise ImportError("Please install pytorch-grad-cam: pip install grad-cam")
+        
+    #     # Create wrapper
+    #     wrapper = self.model.create_gradcam_wrapper(branch=branch, sublayer_idx=sublayer_idx)
+    #     target_layers = wrapper.get_target_layers()
+        
+    #     # Initialize Grad-CAM++
+    #     cam = GradCAMPlusPlus(model=wrapper, target_layers=target_layers)
+        
+    #     # Get prediction
+    #     with torch.no_grad():
+    #         output = self.model(input_tensor)
+    #         probs = F.softmax(output, dim=1)
+    #         pred_class = torch.argmax(probs, dim=1).item()
+    #         confidence = probs[0, pred_class].item()
+        
+    #     # Generate CAM
+    #     if target_class is None:
+    #         target_class = pred_class
+            
+    #     targets = [ClassifierOutputTarget(target_class)]
+    #     grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
+        
+    #     return grayscale_cam[0], pred_class, confidence
     
     def visualize_all_branches(self, input_tensor, output_dir, image_name, true_label=None):
         """
@@ -760,5 +815,6 @@ class GradCAMAnalyzer:
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
