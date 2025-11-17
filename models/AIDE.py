@@ -365,6 +365,143 @@ class Mlp(nn.Module):
         return x
 
 
+class GradCAMAnalyzer:
+    """Wrapper for batch GradCAM++ analysis during evaluation."""
+    
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        self.model.eval()
+        self.model.setup_gradcam()
+    
+    def analyze_dataset(self, data_loader, output_root, max_samples=100, save_fp_fn=True):
+        """
+        Analyze dataset and save GradCAM++ visualizations.
+        
+        Args:
+            data_loader: DataLoader for the dataset
+            output_root: Root directory to save visualizations
+            max_samples: Maximum number of samples to visualize
+            save_fp_fn: If True, only save false positives and false negatives
+        
+        Returns:
+            Dictionary with statistics
+        """
+        import matplotlib.pyplot as plt
+        
+        os.makedirs(output_root, exist_ok=True)
+        
+        stats = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0}
+        sample_count = 0
+        saved_count = 0
+        
+        for batch_idx, batch in enumerate(data_loader):
+            if saved_count >= max_samples:
+                break
+            
+            images = batch[0].to(self.device)  # [B, T, C, H, W]
+            targets = batch[-1].to(self.device)
+            
+            # Get predictions (without gradients for initial pass)
+            with torch.no_grad():
+                logits = self.model(images, return_features=False)
+                predictions = logits.argmax(dim=1)
+            
+            # Process each sample in batch
+            for i in range(images.size(0)):
+                if saved_count >= max_samples:
+                    break
+                
+                pred = predictions[i].item()
+                target = targets[i].item()
+                
+                # Update statistics
+                if pred == 1 and target == 1:
+                    stats['tp'] += 1
+                    category = 'TP'
+                elif pred == 0 and target == 0:
+                    stats['tn'] += 1
+                    category = 'TN'
+                elif pred == 1 and target == 0:
+                    stats['fp'] += 1
+                    category = 'FP'
+                else:
+                    stats['fn'] += 1
+                    category = 'FN'
+                
+                sample_count += 1
+                
+                # Save only FP/FN if requested
+                if save_fp_fn and category not in ['FP', 'FN']:
+                    continue
+                
+                # Generate GradCAM++
+                try:
+                    single_input = images[i:i+1].clone()  # Keep batch dim
+                    single_input.requires_grad = True
+                    
+                    result = self.model.compute_gradcam(single_input, target_class=pred)
+                    
+                    # Get original image (use the semantic token - 5th image)
+                    orig_img = images[i, 4].cpu().permute(1, 2, 0).numpy()
+                    
+                    # Denormalize (assuming ImageNet normalization)
+                    mean = np.array([0.485, 0.456, 0.406])
+                    std = np.array([0.229, 0.224, 0.225])
+                    orig_img = (orig_img * std + mean) * 255
+                    orig_img = orig_img.clip(0, 255).astype(np.uint8)
+                    
+                    # Create visualization
+                    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+                    
+                    # Original image
+                    axes[0].imshow(orig_img)
+                    axes[0].set_title(f'Original\nPred: {"Real" if pred==1 else "Fake"}, GT: {"Real" if target==1 else "Fake"}', 
+                                     fontsize=12, fontweight='bold')
+                    axes[0].axis('off')
+                    
+                    # GradCAM++ for each branch
+                    branch_info = [
+                        ('pfe_min', 'PFE: Lowest Freq'),
+                        ('pfe_max', 'PFE: Highest Freq'),
+                        ('sfe', 'SFE: Semantic')
+                    ]
+                    
+                    for idx, (branch_key, branch_name) in enumerate(branch_info, 1):
+                        if branch_key in result['cams']:
+                            cam = result['cams'][branch_key][0].cpu().numpy()
+                            cam_upsampled = cv2.resize(cam, (orig_img.shape[1], orig_img.shape[0]))
+                            
+                            overlay = overlay_cam_on_image(orig_img, cam_upsampled, alpha=0.5)
+                            axes[idx].imshow(overlay)
+                            axes[idx].set_title(branch_name, fontsize=12, fontweight='bold')
+                            axes[idx].axis('off')
+                        else:
+                            axes[idx].text(0.5, 0.5, f'{branch_name}\nNot Available', 
+                                         ha='center', va='center', fontsize=12)
+                            axes[idx].axis('off')
+                    
+                    plt.suptitle(f'{category} - Sample {saved_count+1}', fontsize=14, fontweight='bold')
+                    plt.tight_layout()
+                    
+                    save_path = os.path.join(output_root, f'{category}_{saved_count:04d}.png')
+                    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                    plt.close()
+                    
+                    saved_count += 1
+                    
+                except Exception as e:
+                    print(f"Error processing sample {sample_count}: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        print(f"\nGradCAM++ Analysis Complete:")
+        print(f"  Total samples processed: {sample_count}")
+        print(f"  Visualizations saved: {saved_count}")
+        
+        return stats
+
+
 class AIDE_Model(nn.Module):
 
     def __init__(self, resnet_path, convnext_path):
@@ -630,5 +767,6 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
