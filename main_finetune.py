@@ -30,7 +30,7 @@ import utils
 from utils import NativeScalerWithGradNormCount as NativeScaler
 from utils import str2bool, remap_checkpoint_keys
 import models.AIDE as AIDE
-
+from models.AIDE import GradCAMAnalyzer  # Add this import
 import csv
 import warnings
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
