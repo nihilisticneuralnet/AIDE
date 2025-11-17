@@ -248,14 +248,26 @@ class AIDEGradCAMWrapper(nn.Module):
         b, t, c, h, w = x.shape
         
         if self.branch == 'patchwise':
-            # Extract the specific sublayer we want to visualize
-            x_layer = x[:, self.sublayer_idx]  # Shape: [b, c, h, w]
+            # Extract all sublayers
+            x_minmin = x[:, 0]   # [b, c, h, w]
+            x_maxmax = x[:, 1]
+            x_minmin1 = x[:, 2]
+            x_maxmax1 = x[:, 3]
+            tokens = x[:, 4]
             
-            # Apply HPF
-            x_layer = self.aide_model.hpf(x_layer)
+            # Apply HPF to all sublayers
+            x_minmin = self.aide_model.hpf(x_minmin)
+            x_maxmax = self.aide_model.hpf(x_maxmax)
+            x_minmin1 = self.aide_model.hpf(x_minmin1)
+            x_maxmax1 = self.aide_model.hpf(x_maxmax1)
             
-            # Forward through ResNet layers
-            x_out = self.aide_model.model_min.conv1(x_layer)
+            # Process the TARGET sublayer (the one we want to visualize) through full ResNet
+            # This is where Grad-CAM++ will hook the gradients
+            sublayers = [x_minmin, x_maxmax, x_minmin1, x_maxmax1]
+            x_target = sublayers[self.sublayer_idx]
+            
+            # Forward through ResNet for the TARGET sublayer (with gradient tracking)
+            x_out = self.aide_model.model_min.conv1(x_target)
             x_out = self.aide_model.model_min.bn1(x_out)
             x_out = self.aide_model.model_min.relu(x_out)
             x_out = self.aide_model.model_min.maxpool(x_out)
@@ -263,19 +275,66 @@ class AIDEGradCAMWrapper(nn.Module):
             x_out = self.aide_model.model_min.layer1(x_out)
             x_out = self.aide_model.model_min.layer2(x_out)
             x_out = self.aide_model.model_min.layer3(x_out)
-            x_out = self.aide_model.model_min.layer4(x_out)  # This is where CAM will hook
+            x_out = self.aide_model.model_min.layer4(x_out)  # This is where CAM will hook!
             
             x_out = self.aide_model.model_min.avgpool(x_out)
-            x_out = x_out.view(x_out.size(0), -1)
+            x_out = x_out.view(x_out.size(0), -1)  # [b, 2048]
             
-            # Now complete the full forward pass for final classification
-            return self.aide_model(x)
+            # Process the OTHER 3 sublayers (without gradient tracking for visualization)
+            other_features = []
+            for i, x_layer in enumerate(sublayers):
+                if i != self.sublayer_idx:
+                    with torch.no_grad():
+                        x_temp = self.aide_model.model_min.conv1(x_layer)
+                        x_temp = self.aide_model.model_min.bn1(x_temp)
+                        x_temp = self.aide_model.model_min.relu(x_temp)
+                        x_temp = self.aide_model.model_min.maxpool(x_temp)
+                        x_temp = self.aide_model.model_min.layer1(x_temp)
+                        x_temp = self.aide_model.model_min.layer2(x_temp)
+                        x_temp = self.aide_model.model_min.layer3(x_temp)
+                        x_temp = self.aide_model.model_min.layer4(x_temp)
+                        x_temp = self.aide_model.model_min.avgpool(x_temp)
+                        x_temp = x_temp.view(x_temp.size(0), -1)
+                        other_features.append(x_temp)
+            
+            # Average all 4 patchwise features (1 with gradients + 3 without)
+            x_patchwise = x_out  # Start with the target (has gradients)
+            for feat in other_features:
+                x_patchwise = x_patchwise + feat
+            x_patchwise = x_patchwise / 4  # [b, 2048]
+            
+            # Process semantic branch (without gradients, as we're visualizing patchwise)
+            with torch.no_grad():
+                clip_mean = torch.Tensor([0.48145466, 0.4578275, 0.40821073])
+                clip_mean = clip_mean.to(tokens.device, non_blocking=True).view(3, 1, 1)
+                clip_std = torch.Tensor([0.26862954, 0.26130258, 0.27577711])
+                clip_std = clip_std.to(tokens.device, non_blocking=True).view(3, 1, 1)
+                dinov2_mean = torch.Tensor([0.485, 0.456, 0.406]).to(tokens.device, non_blocking=True).view(3, 1, 1)
+                dinov2_std = torch.Tensor([0.229, 0.224, 0.225]).to(tokens.device, non_blocking=True).view(3, 1, 1)
+                
+                normalized_tokens = tokens * (dinov2_std / clip_std) + (dinov2_mean - clip_mean) / clip_std
+                local_convnext_image_feats = self.aide_model.openclip_convnext_xxl(normalized_tokens)
+                local_convnext_image_feats = self.aide_model.avgpool(local_convnext_image_feats).view(tokens.size(0), -1)
+                x_semantic = self.aide_model.convnext_proj(local_convnext_image_feats)
+            
+            # Zero out semantic (as per original AIDE forward)
+            x_semantic = x_semantic * 0
+            
+            # Combine and classify
+            x_combined = torch.cat([x_semantic, x_patchwise], dim=1)  # [b, 256 + 2048]
+            output = self.aide_model.fc(x_combined)  # [b, 2]
+            
+            return output
             
         elif self.branch == 'semantic':
-            # For semantic branch, use the tokens (5th tensor)
-            tokens = x[:, 4]  # Shape: [b, c, h, w]
+            # Extract all sublayers
+            x_minmin = x[:, 0]
+            x_maxmax = x[:, 1]
+            x_minmin1 = x[:, 2]
+            x_maxmax1 = x[:, 3]
+            tokens = x[:, 4]  # [b, c, h, w]
             
-            # Apply ConvNeXt with proper normalization
+            # Process semantic branch WITH gradients (this is what we're visualizing)
             clip_mean = torch.Tensor([0.48145466, 0.4578275, 0.40821073])
             clip_mean = clip_mean.to(tokens.device, non_blocking=True).view(3, 1, 1)
             clip_std = torch.Tensor([0.26862954, 0.26130258, 0.27577711])
@@ -285,12 +344,36 @@ class AIDEGradCAMWrapper(nn.Module):
             
             normalized_tokens = tokens * (dinov2_std / clip_std) + (dinov2_mean - clip_mean) / clip_std
             
-            # Make this part require gradients for CAM
+            # Make sure this requires gradients for CAM
             normalized_tokens.requires_grad_(True)
-            local_convnext_image_feats = self.aide_model.openclip_convnext_xxl(normalized_tokens)
             
-            # Complete the forward pass
-            return self.aide_model(x)
+            # Forward through ConvNeXt (where CAM will hook!)
+            local_convnext_image_feats = self.aide_model.openclip_convnext_xxl(normalized_tokens)
+            local_convnext_image_feats = self.aide_model.avgpool(local_convnext_image_feats).view(tokens.size(0), -1)
+            x_semantic = self.aide_model.convnext_proj(local_convnext_image_feats)  # [b, 256]
+            
+            # Process patchwise branch WITHOUT gradients (as we're visualizing semantic)
+            with torch.no_grad():
+                x_minmin = self.aide_model.hpf(x_minmin)
+                x_maxmax = self.aide_model.hpf(x_maxmax)
+                x_minmin1 = self.aide_model.hpf(x_minmin1)
+                x_maxmax1 = self.aide_model.hpf(x_maxmax1)
+                
+                x_min = self.aide_model.model_min(x_minmin)
+                x_max = self.aide_model.model_max(x_maxmax)
+                x_min1 = self.aide_model.model_min(x_minmin1)
+                x_max1 = self.aide_model.model_max(x_maxmax1)
+                
+                x_patchwise = (x_min + x_max + x_min1 + x_max1) / 4  # [b, 2048]
+            
+            # Zero out semantic (as per original AIDE forward)
+            x_semantic = x_semantic * 0
+            
+            # Combine and classify
+            x_combined = torch.cat([x_semantic, x_patchwise], dim=1)  # [b, 256 + 2048]
+            output = self.aide_model.fc(x_combined)  # [b, 2]
+            
+            return output
         
         else:
             raise ValueError(f"Unknown branch: {self.branch}")
@@ -658,3 +741,4 @@ class GradCAMAnalyzer:
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
