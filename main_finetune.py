@@ -25,6 +25,7 @@ from optim_factory import create_optimizer, LayerDecayValueAssigner
 
 from data.datasets import TrainDataset, TestDataset
 from engine_finetune import train_one_epoch, evaluate
+from generate_cams import generate_cams_for_dataset, save_cam_visualization
 
 import utils
 from utils import NativeScalerWithGradNormCount as NativeScaler
@@ -189,6 +190,20 @@ def get_args_parser():
                         help='Directory to save Grad-CAM++ visualizations')
     parser.add_argument('--gradcam_max_samples', default=100, type=int,
                         help='Maximum number of samples for Grad-CAM++ analysis')
+    parser.add_argument('--generate_cams', type=str2bool, default=False,
+                    help='Generate Grad-CAM++ visualizations during evaluation')
+    parser.add_argument('--cam_branches', nargs='+', 
+                        default=['pfe_high', 'pfe_low', 'sfe'],
+                        choices=['pfe_high', 'pfe_low', 'sfe'],
+                        help='Branches to compute CAMs for')
+    parser.add_argument('--cam_output_dir', type=str, default=None,
+                        help='Output directory for CAM visualizations')
+    parser.add_argument('--cam_save_raw', type=str2bool, default=True,
+                        help='Save raw CAM heatmaps as .npy files')
+    parser.add_argument('--cam_save_overlay', type=str2bool, default=True,
+                        help='Save CAM overlay visualizations')
+    parser.add_argument('--cam_num_samples', type=int, default=None,
+                        help='Number of samples to generate CAMs for (None for all)')
     
     return parser
 
