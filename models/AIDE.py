@@ -9,6 +9,58 @@ from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.utils.image import show_cam_on_image
 import torch.nn.functional as F
 
+def save_cam_visualization(rgb_image, cams, file_name, output_dir, pred_prob, true_label, pred_label):
+    """
+    Save CAM visualizations as a grid
+    
+    Args:
+        rgb_image: [3, H, W] tensor
+        cams: dict of {branch: heatmap [H, W]}
+        file_name: str
+        output_dir: str
+        pred_prob: float
+        true_label: int
+        pred_label: int
+    """
+    # Convert RGB image to numpy [H, W, 3] in range [0, 1]
+    rgb_img = rgb_image.permute(1, 2, 0).cpu().numpy()
+    rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-8)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle(f'{file_name}\nPred: {pred_label} ({pred_prob:.3f}) | True: {true_label}', 
+                 fontsize=14)
+    
+    # Original image
+    axes[0, 0].imshow(rgb_img)
+    axes[0, 0].set_title('Original')
+    axes[0, 0].axis('off')
+    
+    # CAM overlays
+    branch_names = ['PFE High-Freq', 'PFE Low-Freq', 'SFE Semantic', 'Fused']
+    branch_keys = ['pfe_high', 'pfe_low', 'sfe', 'fused']
+    positions = [(0, 1), (0, 2), (1, 0), (1, 1)]
+    
+    for (row, col), name, key in zip(positions, branch_names, branch_keys):
+        cam = cams[key]
+        # Resize CAM to match image size
+        cam_resized = cv2.resize(cam, (rgb_img.shape[1], rgb_img.shape[0]))
+        
+        # Create overlay
+        cam_overlay = show_cam_on_image(rgb_img, cam_resized, use_rgb=True)
+        
+        axes[row, col].imshow(cam_overlay)
+        axes[row, col].set_title(name)
+        axes[row, col].axis('off')
+    
+    # Raw fused heatmap
+    axes[1, 2].imshow(cams['fused'], cmap='jet')
+    axes[1, 2].set_title('Fused Heatmap (raw)')
+    axes[1, 2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{file_name}_cam.png'), dpi=150, bbox_inches='tight')
+    plt.close() 
+  
 class HPF(nn.Module):
   def __init__(self):
     super(HPF, self).__init__()
@@ -464,9 +516,11 @@ class AIDE_Model(nn.Module):
         # Return logits
         return self.fc(torch.cat([features, torch.zeros(b, 2048, device=x.device)], dim=1))
 
+
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
 
