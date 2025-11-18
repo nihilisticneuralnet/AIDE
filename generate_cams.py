@@ -95,7 +95,7 @@ def upsample_heatmap(heatmap, target_size):
         align_corners=False
     )
     
-    return upsampled.squeeze()
+    return upsampled.squeeze(1) if upsampled.dim() == 4 else upsampled.squeeze()
 
 
 def apply_colormap(heatmap_np, colormap=cv2.COLORMAP_JET):
@@ -285,10 +285,11 @@ def generate_cams_for_dataset(
     print(f"Generating Grad-CAM++ visualizations for {len(branches)} branches...")
     
     for batch_idx, (images, filenames) in enumerate(tqdm(dataloader)):
+        # Move images to device - at this point images is [B, C, H, W]
         images = images.to(device)
         b, c, h, w = images.shape
         
-        # Prepare AIDE input
+        # Prepare AIDE input - this converts [B, C, H, W] to [B, 5, C, H, W]
         aide_input = prepare_aide_input(images, device)
         
         # Store heatmaps for fusion
@@ -416,7 +417,7 @@ def main():
     
     # Load model
     print("Loading AIDE model...")
-    model = AIDE(args.resnet_path, args.convnext_path)
+    model = AIDE.AIDE(args.resnet_path, args.convnext_path)
     
     checkpoint = torch.load(args.checkpoint, map_location=device)
     if 'model_state_dict' in checkpoint:
