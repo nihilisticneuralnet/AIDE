@@ -330,7 +330,7 @@ class AIDE_Model(nn.Module):
         """
         Generate Grad-CAM++ heatmaps using manual implementation
         """
-        self.train()  # Need gradients
+        self.eval()  # Keep model in eval mode, just enable gradients
         cams = {}
         
         # Get prediction if target_class not specified
@@ -348,16 +348,25 @@ class AIDE_Model(nn.Module):
                 # Hook functions
                 def forward_hook(module, input, output):
                     activations.append(output.detach())
+                    # Also store a version that requires grad for backward pass
+                    output.retain_grad()
                 
                 def backward_hook(module, grad_input, grad_output):
-                    gradients.append(grad_output[0].detach())
+                    if grad_output[0] is not None:
+                        gradients.append(grad_output[0].detach())
                 
                 # Register hooks on target layer
                 target_layers = self.get_target_layers(branch)
+                if not target_layers:
+                    raise ValueError(f"No target layers found for branch {branch}")
+                
                 forward_handle = target_layers[0].register_forward_hook(forward_hook)
                 backward_handle = target_layers[0].register_full_backward_hook(backward_hook)
                 
-                # Forward pass
+                # Ensure input requires grad
+                input_tensor.requires_grad_(True)
+                
+                # Forward pass with gradient tracking
                 if branch == 'pfe_high':
                     logits = self._forward_pfe_only(input_tensor, 'pfe_high')
                 elif branch == 'pfe_low':
@@ -365,14 +374,22 @@ class AIDE_Model(nn.Module):
                 elif branch == 'sfe':
                     logits = self._forward_sfe_only(input_tensor)
                 
+                # Ensure logits require grad
+                if not logits.requires_grad:
+                    raise RuntimeError(f"Logits don't require gradients for branch {branch}")
+                
                 # Backward pass
                 self.zero_grad()
                 score = logits[:, target_class]
-                score.backward()
+                score.backward(retain_graph=True)
                 
                 # Remove hooks
                 forward_handle.remove()
                 backward_handle.remove()
+                
+                # Check if gradients were captured
+                if len(gradients) == 0:
+                    raise RuntimeError(f"No gradients captured for branch {branch}. Check if backward hook is triggered.")
                 
                 # Compute Grad-CAM++
                 feature_map = activations[0]  # [1, C, H, W]
@@ -404,8 +421,10 @@ class AIDE_Model(nn.Module):
                 traceback.print_exc()
                 h, w = input_tensor.shape[-2:]
                 cams[branch] = np.zeros((h, w))
+            finally:
+                # Clean up
+                input_tensor.requires_grad_(False)
         
-        self.eval()  # Back to eval mode
         return cams
 
     def _forward_pfe_only(self, x, branch):
@@ -447,6 +466,7 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
 
