@@ -25,7 +25,85 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 from pytorch_grad_cam.utils.image import show_cam_on_image
+import matplotlib.pyplot as plt
+import matplotlib.cm
+import cv2
+import numpy as np
+import os
 
+def save_cam_visualization(rgb_image, cams, file_name, output_dir, pred_prob, true_label, pred_label):
+    """
+    Save CAM visualizations as a grid without pytorch_grad_cam dependency
+    
+    Args:
+        rgb_image: [3, H, W] tensor
+        cams: dict of {branch: heatmap [H, W]}
+        file_name: str
+        output_dir: str
+        pred_prob: float
+        true_label: int
+        pred_label: int
+    """
+    # Convert RGB image to numpy [H, W, 3] in range [0, 1]
+    rgb_img = rgb_image.permute(1, 2, 0).cpu().numpy()
+    rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-8)
+    rgb_img = np.clip(rgb_img, 0, 1)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle(f'{file_name}\nPred: {pred_label} ({pred_prob:.3f}) | True: {true_label}', 
+                 fontsize=14)
+    
+    # Original image
+    axes[0, 0].imshow(rgb_img)
+    axes[0, 0].set_title('Original')
+    axes[0, 0].axis('off')
+    
+    # CAM overlays
+    branch_names = ['PFE High-Freq', 'PFE Low-Freq', 'SFE Semantic', 'Fused']
+    branch_keys = ['pfe_high', 'pfe_low', 'sfe', 'fused']
+    positions = [(0, 1), (0, 2), (1, 0), (1, 1)]
+    
+    for (row, col), name, key in zip(positions, branch_names, branch_keys):
+        cam = cams[key]
+        
+        # Resize CAM to match image size if needed
+        if cam.shape != (rgb_img.shape[0], rgb_img.shape[1]):
+            cam_resized = cv2.resize(cam, (rgb_img.shape[1], rgb_img.shape[0]))
+        else:
+            cam_resized = cam
+        
+        # Normalize CAM to [0, 1]
+        cam_normalized = (cam_resized - cam_resized.min()) / (cam_resized.max() - cam_resized.min() + 1e-8)
+        
+        # Apply colormap (jet)
+        cam_colored = plt.cm.jet(cam_normalized)[:, :, :3]  # [H, W, 3], remove alpha channel
+        
+        # Blend with original image
+        alpha = 0.5
+        cam_overlay = (1 - alpha) * rgb_img + alpha * cam_colored
+        cam_overlay = np.clip(cam_overlay, 0, 1)
+        
+        axes[row, col].imshow(cam_overlay)
+        axes[row, col].set_title(name)
+        axes[row, col].axis('off')
+    
+    # Raw fused heatmap
+    axes[1, 2].imshow(cams['fused'], cmap='jet')
+    axes[1, 2].set_title('Fused Heatmap (raw)')
+    axes[1, 2].axis('off')
+    
+    plt.tight_layout()
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Clean filename
+    safe_filename = "".join([c for c in str(file_name) if c.isalnum() or c in (' ', '-', '_')]).rstrip()
+    if not safe_filename:
+        safe_filename = 'sample'
+    
+    plt.savefig(os.path.join(output_dir, f'{safe_filename}_cam.png'), dpi=150, bbox_inches='tight')
+    plt.close()
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
