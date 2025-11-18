@@ -311,10 +311,32 @@ class AIDE_Model(nn.Module):
 
     
     
-    def forward(self, x):
-      
-        b, t, c, h, w = x.shape
+    
 
+    def enable_cam_mode(self):
+            """Enable Grad-CAM++ extraction mode"""
+            self.cam_mode = True
+            if self.cam_wrapper is None:
+                self.cam_wrapper = AIDEGradCAMWrapper(self)
+            self.eval()  # Always use eval mode for CAM
+        
+    def disable_cam_mode(self):
+        """Disable CAM mode"""
+        self.cam_mode = False
+    
+    def forward(self, x, return_cam=False, cam_type='pfe_min', target_class=None):
+        """
+        Modified forward with optional CAM generation
+        
+        Args:
+            x: Input tensor [B, T, C, H, W]
+            return_cam: If True, return (logits, cam_heatmap)
+            cam_type: Type of CAM to generate
+            target_class: Target class for CAM (None = predicted class)
+        """
+        # Standard forward pass
+        b, t, c, h, w = x.shape
+        # ... existing forward code ...
         x_minmin = x[:, 0] #[b, c, h, w]
         x_maxmax = x[:, 1]
         x_minmin1 = x[:, 2]
@@ -359,52 +381,26 @@ class AIDE_Model(nn.Module):
         # x = torch.cat([0.1 * x_0, 0.9 * x_1], dim=1)
 
         x = self.fc(x)
-
-        return x
-
-    def enable_cam_mode(self):
-            """Enable Grad-CAM++ extraction mode"""
-            self.cam_mode = True
-            if self.cam_wrapper is None:
-                self.cam_wrapper = AIDEGradCAMWrapper(self)
-            self.eval()  # Always use eval mode for CAM
         
-        def disable_cam_mode(self):
-            """Disable CAM mode"""
-            self.cam_mode = False
+        logits = self.fc(x)
         
-        def forward(self, x, return_cam=False, cam_type='pfe_min', target_class=None):
-            """
-            Modified forward with optional CAM generation
+        if return_cam and self.cam_mode:
+            # Generate CAM after forward pass
+            if target_class is None:
+                target_class = logits.argmax(dim=1).item()
             
-            Args:
-                x: Input tensor [B, T, C, H, W]
-                return_cam: If True, return (logits, cam_heatmap)
-                cam_type: Type of CAM to generate
-                target_class: Target class for CAM (None = predicted class)
-            """
-            # Standard forward pass
-            b, t, c, h, w = x.shape
-            # ... existing forward code ...
-            
-            logits = self.fc(x)
-            
-            if return_cam and self.cam_mode:
-                # Generate CAM after forward pass
-                if target_class is None:
-                    target_class = logits.argmax(dim=1).item()
-                
-                cam_heatmap = self.cam_wrapper.generate_cam(
-                    input_tensor=x,
-                    target_class=target_class,
-                    cam_type=cam_type
-                )
-                return logits, cam_heatmap
-            
-            return logits
+            cam_heatmap = self.cam_wrapper.generate_cam(
+                input_tensor=x,
+                target_class=target_class,
+                cam_type=cam_type
+            )
+            return logits, cam_heatmap
+        
+        return logits
       
 
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
