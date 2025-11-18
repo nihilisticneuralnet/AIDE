@@ -307,9 +307,101 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
     acc = accuracy_score(y_true, y_pred > 0.5)
     ap = average_precision_score(y_true, y_pred)
     
-   
+    # NEW: Generate Grad-CAM++ visualizations if requested
+    cam_results = None
+    if generate_cams and cam_output_dir is not None:
+        print(f"\nGenerating Grad-CAM++ visualizations...")
+        os.makedirs(cam_output_dir, exist_ok=True)
+        
+        cam_results = {
+            'pfe_high': [],
+            'pfe_low': [],
+            'sfe': [],
+            'fused': []
+        }
+        
+        model.eval()
+        torch.set_grad_enabled(True)  # Enable gradients for CAM
+        
+        cam_count = 0
+        for batch_idx, batch in enumerate(data_loader):
+            if cam_count >= num_cam_samples:
+                break
+            
+            images = batch[0].to(device)
+            target = batch[-1].to(device)
+            
+            # Get file names if available
+            try:
+                file_names = batch[2] if len(batch) > 2 else None
+            except:
+                file_names = None
+            
+            batch_size = images.shape[0]
+            
+            for i in range(batch_size):
+                if cam_count >= num_cam_samples:
+                    break
+                
+                single_image = images[i:i+1]  # [1, 5, 3, H, W]
+                single_target = target[i].item()
+                
+                # Get prediction
+                with torch.no_grad():
+                    logits = model(single_image)
+                    pred_class = logits.argmax(dim=1).item()
+                    pred_prob = torch.softmax(logits, dim=1)[0, 1].item()
+                
+                # Generate CAMs for all branches
+                try:
+                    cams = model.module.generate_gradcam(
+                        single_image, 
+                        target_class=1,  # Always target "fake" class
+                        branches=['pfe_high', 'pfe_low', 'sfe']
+                    ) if hasattr(model, 'module') else model.generate_gradcam(
+                        single_image,
+                        target_class=1,
+                        branches=['pfe_high', 'pfe_low', 'sfe']
+                    )
+                    
+                    # Fuse CAMs (simple average)
+                    fused_cam = np.mean([
+                        cams['pfe_high'],
+                        cams['pfe_low'],
+                        cams['sfe']
+                    ], axis=0)
+                    cams['fused'] = fused_cam
+                    
+                    # Store results
+                    for branch in ['pfe_high', 'pfe_low', 'sfe', 'fused']:
+                        cam_results[branch].append(cams[branch])
+                    
+                    # Save visualization
+                    file_name = file_names[i] if file_names else f"sample_{cam_count}"
+                    save_cam_visualization(
+                        single_image[0, 4].cpu(),  # Use the RGB token image
+                        cams,
+                        file_name,
+                        cam_output_dir,
+                        pred_prob,
+                        single_target,
+                        pred_class
+                    )
+                    
+                    cam_count += 1
+                    if cam_count % 10 == 0:
+                        print(f"Generated {cam_count}/{num_cam_samples} CAMs")
+                
+                except Exception as e:
+                    print(f"Error generating CAM for sample {cam_count}: {e}")
+                    continue
+        
+        torch.set_grad_enabled(False)  # Disable gradients again
+        print(f"✅ Generated {cam_count} Grad-CAM++ visualizations in {cam_output_dir}")
+    
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true, cam_results
 
     # return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap
     
     # my code to return predictions and ground truths
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true
+    # return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true
