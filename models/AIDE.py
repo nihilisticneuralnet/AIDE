@@ -5,6 +5,9 @@ import clip
 import open_clip
 from .srm_filter_kernel import all_normalized_hpf_list
 import numpy as np
+from pytorch_grad_cam import GradCAMPlusPlus
+from pytorch_grad_cam.utils.image import show_cam_on_image
+import torch.nn.functional as F
 
 class HPF(nn.Module):
   def __init__(self):
@@ -248,7 +251,7 @@ class AIDE_Model(nn.Module):
 
     
 
-    def forward(self, x):
+    def forward(self, x, return_cam=False, cam_branches=None):
 
         b, t, c, h, w = x.shape
 
@@ -296,9 +299,126 @@ class AIDE_Model(nn.Module):
         # x = torch.cat([0.1 * x_0, 0.9 * x_1], dim=1)
 
         x = self.fc(x)
+      
+        if return_cam:
+            if cam_branches is None:
+                cam_branches = ['pfe_high', 'pfe_low', 'sfe']
+            # Note: CAM generation is done separately in evaluate() to avoid autograd issues
+            return x
 
         return x
+
+    def get_target_layers(self, branch='pfe_high'):
+        """
+        Returns target layers for Grad-CAM++
+        branch: 'pfe_high', 'pfe_low', or 'sfe'
+        """
+        if branch == 'pfe_high':
+            # Target the final conv3 in layer4 of model_max (highest frequency)
+            return [self.model_max.layer4[-1].conv3]
+        elif branch == 'pfe_low':
+            # Target the final conv3 in layer4 of model_min (lowest frequency)
+            return [self.model_min.layer4[-1].conv3]
+        elif branch == 'sfe':
+            # Target the last conv block before projection in ConvNeXt
+            # ConvNeXt stages are in self.openclip_convnext_xxl.stages
+            return [self.openclip_convnext_xxl.stages[-1].blocks[-1]]
+        else:
+            raise ValueError(f"Unknown branch: {branch}")
+
+    def generate_gradcam(self, input_tensor, target_class=None, branches=['pfe_high', 'pfe_low', 'sfe']):
+        """
+        Generate Grad-CAM++ heatmaps for specified branches
+        
+        Args:
+            input_tensor: [1, 5, 3, H, W] tensor (single image batch)
+            target_class: class index for CAM (None = predicted class)
+            branches: list of branches to generate CAMs for
+        
+        Returns:
+            dict: {branch_name: numpy heatmap [H, W]}
+        """
+        self.eval()
+        cams = {}
+        
+        for branch in branches:
+            target_layers = self.get_target_layers(branch)
+            
+            # Create wrapper model that outputs logits for this branch
+            if branch.startswith('pfe'):
+                # For PFE branches, we need to isolate the ResNet forward path
+                def forward_wrapper(x):
+                    return self._forward_pfe_only(x, branch)
+                cam_model = self
+            else:  # SFE
+                def forward_wrapper(x):
+                    return self._forward_sfe_only(x)
+                cam_model = self
+            
+            # Initialize Grad-CAM++
+            cam_extractor = GradCAMPlusPlus(
+                model=cam_model,
+                target_layers=target_layers
+            )
+            
+            # Generate CAM (targets the logit for fake class, index 1)
+            if target_class is None:
+                # Use predicted class
+                with torch.no_grad():
+                    logits = self.forward(input_tensor)
+                    target_class = logits.argmax(dim=1).item()
+            
+            grayscale_cam = cam_extractor(
+                input_tensor=input_tensor,
+                targets=[target_class],
+                aug_smooth=False,
+                eigen_smooth=False
+            )
+            
+            # grayscale_cam shape: [1, H, W]
+            cams[branch] = grayscale_cam[0]  # [H, W]
+            
+            del cam_extractor
+        
+        return cams
+
+    def _forward_pfe_only(self, x, branch):
+        """Forward pass through PFE branch only"""
+        b, t, c, h, w = x.shape
+        
+        if branch == 'pfe_high':
+            x_branch = x[:, 1]  # maxmax
+            x_hpf = self.hpf(x_branch)
+            features = self.model_max(x_hpf)
+        else:  # pfe_low
+            x_branch = x[:, 0]  # minmin
+            x_hpf = self.hpf(x_branch)
+            features = self.model_min(x_hpf)
+        
+        # Return logits
+        return self.fc(torch.cat([torch.zeros(b, 256, device=x.device), features], dim=1))
+    
+    def _forward_sfe_only(self, x):
+        """Forward pass through SFE branch only"""
+        b, t, c, h, w = x.shape
+        tokens = x[:, 4]
+        
+        with torch.no_grad():
+            clip_mean = torch.Tensor([0.48145466, 0.4578275, 0.40821073]).to(tokens).view(3, 1, 1)
+            clip_std = torch.Tensor([0.26862954, 0.26130258, 0.27577711]).to(tokens).view(3, 1, 1)
+            dinov2_mean = torch.Tensor([0.485, 0.456, 0.406]).to(tokens).view(3, 1, 1)
+            dinov2_std = torch.Tensor([0.229, 0.224, 0.225]).to(tokens).view(3, 1, 1)
+            
+            local_convnext_image_feats = self.openclip_convnext_xxl(
+                tokens * (dinov2_std / clip_std) + (dinov2_mean - clip_mean) / clip_std
+            )
+            local_convnext_image_feats = self.avgpool(local_convnext_image_feats).view(b, -1)
+            features = self.convnext_proj(local_convnext_image_feats)
+        
+        # Return logits
+        return self.fc(torch.cat([features, torch.zeros(b, 2048, device=x.device)], dim=1))
 
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
