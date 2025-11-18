@@ -5,10 +5,6 @@ import clip
 import open_clip
 from .srm_filter_kernel import all_normalized_hpf_list
 import numpy as np
-from pytorch_grad_cam import GradCAMPlusPlus
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
-
 
 class HPF(nn.Module):
   def __init__(self):
@@ -208,63 +204,6 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         return x
 
-
-class AIDEGradCAMWrapper:
-    """Wrapper to handle Grad-CAM++ for different branches of AIDE"""
-    
-    def __init__(self, model):
-        self.model = model
-        self.cam_extractors = {}
-        self._setup_cam_layers()
-    
-    def _setup_cam_layers(self):
-        # PFE branches - target layer4's final Bottleneck conv3
-        self.cam_extractors['pfe_min'] = GradCAMPlusPlus(
-            model=self.model,
-            target_layers=[self.model.model_min.layer4[-1].conv3]
-        )
-        self.cam_extractors['pfe_max'] = GradCAMPlusPlus(
-            model=self.model,
-            target_layers=[self.model.model_max.layer4[-1].conv3]
-        )
-        
-        # SFE branch - target last conv block before projection
-        # ConvNeXt structure: stages -> blocks -> conv layers
-        self.cam_extractors['sfe'] = GradCAMPlusPlus(
-            model=self.model,
-            target_layers=[self.model.openclip_convnext_xxl.stages[-1].blocks[-1]]
-        )
-    
-    def generate_cam(self, input_tensor, target_class=None, cam_type='pfe_min'):
-        """
-        Generate Grad-CAM++ heatmap for specified branch
-        
-        Args:
-            input_tensor: Input batch [B, T, C, H, W]
-            target_class: Target class index (None for predicted class)
-            cam_type: One of ['pfe_min', 'pfe_max', 'sfe', 'fused']
-        
-        Returns:
-            cam_map: Numpy array [B, H, W] normalized to [0, 1]
-        """
-        targets = [ClassifierOutputTarget(target_class)] if target_class else None
-        
-        if cam_type == 'fused':
-            # Generate CAMs for all branches and average
-            cams = []
-            for branch in ['pfe_min', 'pfe_max', 'sfe']:
-                cam = self.cam_extractors[branch](
-                    input_tensor=input_tensor,
-                    targets=targets
-                )
-                cams.append(cam)
-            return np.mean(cams, axis=0)
-        else:
-            return self.cam_extractors[cam_type](
-                input_tensor=input_tensor,
-                targets=targets
-            )
-          
 class AIDE_Model(nn.Module):
 
     def __init__(self, resnet_path, convnext_path):
@@ -272,8 +211,6 @@ class AIDE_Model(nn.Module):
         self.hpf = HPF()
         self.model_min = ResNet(Bottleneck, [3, 4, 6, 3])
         self.model_max = ResNet(Bottleneck, [3, 4, 6, 3])
-        self.cam_mode = False
-        self.cam_wrapper = None
        
         if resnet_path is not None:
             pretrained_dict = torch.load(resnet_path, map_location='cpu', weights_only=False)
@@ -310,33 +247,11 @@ class AIDE_Model(nn.Module):
             param.requires_grad = False
 
     
-    
-    
 
-    def enable_cam_mode(self):
-            """Enable Grad-CAM++ extraction mode"""
-            self.cam_mode = True
-            if self.cam_wrapper is None:
-                self.cam_wrapper = AIDEGradCAMWrapper(self)
-            self.eval()  # Always use eval mode for CAM
-        
-    def disable_cam_mode(self):
-        """Disable CAM mode"""
-        self.cam_mode = False
-    
-    def forward(self, x, return_cam=False, cam_type='pfe_min', target_class=None):
-        """
-        Modified forward with optional CAM generation
-        
-        Args:
-            x: Input tensor [B, T, C, H, W]
-            return_cam: If True, return (logits, cam_heatmap)
-            cam_type: Type of CAM to generate
-            target_class: Target class for CAM (None = predicted class)
-        """
-        # Standard forward pass
+    def forward(self, x):
+
         b, t, c, h, w = x.shape
-        # ... existing forward code ...
+
         x_minmin = x[:, 0] #[b, c, h, w]
         x_maxmax = x[:, 1]
         x_minmin1 = x[:, 2]
@@ -381,26 +296,9 @@ class AIDE_Model(nn.Module):
         # x = torch.cat([0.1 * x_0, 0.9 * x_1], dim=1)
 
         x = self.fc(x)
-        
-        logits = self.fc(x)
-        
-        if return_cam and self.cam_mode:
-            # Generate CAM after forward pass
-            if target_class is None:
-                target_class = logits.argmax(dim=1).item()
-            
-            cam_heatmap = self.cam_wrapper.generate_cam(
-                input_tensor=x,
-                target_class=target_class,
-                cam_type=cam_type
-            )
-            return logits, cam_heatmap
-        
-        return logits
-      
+
+        return x
 
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
-
-
