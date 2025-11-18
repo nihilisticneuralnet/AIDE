@@ -359,7 +359,7 @@ def main(args):
             )
 
 
-            test_stats, acc, ap = evaluate(data_loader_val, model, device)
+            test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
             if args.generate_cams:
                 cam_out_dir = args.cam_output_dir or os.path.join(args.output_dir, 'cams', val)
                 print(f"Generating Grad-CAM++ visualizations for {val}...")
@@ -414,7 +414,7 @@ def main(args):
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
         if data_loader_val is not None:
-            test_stats, acc, ap = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
+            test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
             print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%, ap: {ap}.")
             if max_accuracy < test_stats["acc1"]:
                 max_accuracy = test_stats["acc1"]
@@ -436,7 +436,7 @@ def main(args):
             
             # repeat testing routines for EMA, if ema eval is turned on
             if args.model_ema and args.model_ema_eval:
-                test_stats_ema, acc, ap = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp)
+                test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
                 print(f"Accuracy of the model EMA on {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%, ap: {ap}")
                 if max_accuracy_ema < test_stats_ema["acc1"]:
                     max_accuracy_ema = test_stats_ema["acc1"]
