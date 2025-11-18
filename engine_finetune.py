@@ -203,7 +203,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, use_amp=False, distributed=False,generate_cams=False, cam_output_dir=None):
+def evaluate(data_loader, model, device, use_amp=False, distributed=False):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -211,11 +211,6 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,genera
 
     # switch to evaluation mode
     model.eval()
-    
-    if generate_cams:
-        model.enable_cam_mode()
-        os.makedirs(cam_output_dir, exist_ok=True)
-        cam_types = ['pfe_min', 'pfe_max', 'sfe', 'fused']
 
     for index, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
         images = batch[0]
@@ -223,39 +218,6 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,genera
 
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
-
-        # Standard forward pass
-        output = model(images)
-        if isinstance(output, dict):
-            output = output['logits']
-        loss = criterion(output, target)
-        
-        # Generate CAMs if requested
-        if generate_cams:
-            batch_size = images.shape[0]
-            for b_idx in range(batch_size):
-                sample_img = images[b_idx:b_idx+1]
-                pred_class = output[b_idx].argmax().item()
-                true_class = target[b_idx].item()
-                
-                # Generate CAM for each branch
-                for cam_type in cam_types:
-                    _, cam_heatmap = model(
-                        sample_img,
-                        return_cam=True,
-                        cam_type=cam_type,
-                        target_class=pred_class
-                    )
-                    
-                    # Save CAM visualization
-                    save_cam_visualization(
-                        image=sample_img[0, 0].cpu(),  # Use first frame
-                        cam_heatmap=cam_heatmap[0],
-                        save_path=os.path.join(
-                            cam_output_dir,
-                            f'sample_{index}_{b_idx}_{cam_type}_pred{pred_class}_true{true_class}.png'
-                        )
-                    )
 
         # compute output
         if use_amp:
@@ -278,7 +240,7 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,genera
             predictions = torch.cat((predictions, output), 0)
             labels = torch.cat((labels, target), 0)
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchroni?ze()
 
         acc1, acc5 = accuracy(output, target, topk=(1, 2))
 
@@ -287,8 +249,6 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,genera
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
     # gather the stats from all processes
-    if generate_cams:
-        model.disable_cam_mode()
     metric_logger.synchronize_between_processes()
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
@@ -349,54 +309,3 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,genera
     
     # my code to return predictions and ground truths
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true
-
-
-
-
-def save_cam_visualization(image, cam_heatmap, save_path):
-    """
-    Save CAM overlay on original image
-    
-    Args:
-        image: Original image tensor [C, H, W]
-        cam_heatmap: CAM heatmap array [H, W]
-        save_path: Path to save visualization
-    """
-    import cv2
-    import matplotlib.pyplot as plt
-    
-    # Denormalize image to [0, 1]
-    img_np = image.permute(1, 2, 0).numpy()
-    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-    
-    # Create heatmap overlay
-    heatmap = cv2.applyColorMap(
-        np.uint8(255 * cam_heatmap),
-        cv2.COLORMAP_JET
-    )
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
-    
-    # Overlay
-    overlay = 0.4 * heatmap + 0.6 * img_np
-    overlay = np.clip(overlay, 0, 1)
-    
-    # Save
-    plt.figure(figsize=(12, 4))
-    plt.subplot(131)
-    plt.imshow(img_np)
-    plt.title('Original')
-    plt.axis('off')
-    
-    plt.subplot(132)
-    plt.imshow(cam_heatmap, cmap='jet')
-    plt.title('CAM Heatmap')
-    plt.axis('off')
-    
-    plt.subplot(133)
-    plt.imshow(overlay)
-    plt.title('Overlay')
-    plt.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
