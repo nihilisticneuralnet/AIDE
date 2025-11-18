@@ -287,6 +287,15 @@ def generate_cams_for_dataset(
     for batch_idx, (images, filenames) in enumerate(tqdm(dataloader)):
         # Move images to device - at this point images is [B, C, H, W]
         images = images.to(device)
+        
+        # Debug: check shape
+        print(f"Debug - images.shape: {images.shape}")
+        
+        # Handle case where images might have extra dimensions
+        if images.dim() == 5:
+            # If already [B, T, C, H, W], take the first temporal slice
+            images = images[:, 0]
+        
         b, c, h, w = images.shape
         
         # Prepare AIDE input - this converts [B, C, H, W] to [B, 5, C, H, W]
@@ -449,11 +458,16 @@ def main():
     
     print(f"Processing {len(dataset)} images...")
     
+    # Test single image first
+    test_img, test_name = dataset[0]
+    print(f"Single image shape: {test_img.shape}")
+    print(f"Expected shape: [C, H, W] = [3, {args.image_size}, {args.image_size}]")
+    
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=0,  # Changed to 0 for debugging
         pin_memory=True
     )
     
