@@ -354,8 +354,7 @@ class AIDE_Model(nn.Module):
             # Important: pass the whole model, not a wrapper
             cam_extractor = GradCAMPlusPlus(
                 model=self,
-                target_layers=target_layers,
-                use_cuda=input_tensor.is_cuda
+                target_layers=target_layers
             )
             
             # Create custom target for the specific class
@@ -430,5 +429,6 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
