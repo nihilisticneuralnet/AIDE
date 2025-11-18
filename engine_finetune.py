@@ -22,6 +22,9 @@ from sklearn.metrics import (
     accuracy_score
 )
 import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+from pytorch_grad_cam.utils.image import show_cam_on_image
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -203,7 +206,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, use_amp=False, distributed=False):
+def evaluate(data_loader, model, device, use_amp=False, distributed=False, 
+             generate_cams=False, cam_output_dir=None, num_cam_samples=100):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
