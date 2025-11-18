@@ -328,9 +328,9 @@ class AIDE_Model(nn.Module):
 
     def generate_gradcam(self, input_tensor, target_class=None, branches=['pfe_high', 'pfe_low', 'sfe']):
         """
-        Generate Grad-CAM++ heatmaps using manual implementation
+        Generate Grad-CAM++ heatmaps using direct gradient access
         """
-        self.eval()  # Keep model in eval mode, just enable gradients
+        self.eval()  # Keep model in eval mode
         cams = {}
         
         # Get prediction if target_class not specified
@@ -341,27 +341,19 @@ class AIDE_Model(nn.Module):
         
         for branch in branches:
             try:
-                # Storage for activations and gradients
+                # Storage for activations
                 activations = []
-                gradients = []
                 
-                # Hook functions
+                # Hook function to capture activations
                 def forward_hook(module, input, output):
-                    activations.append(output.detach())
-                    # Also store a version that requires grad for backward pass
-                    output.retain_grad()
+                    activations.append(output)
                 
-                def backward_hook(module, grad_input, grad_output):
-                    if grad_output[0] is not None:
-                        gradients.append(grad_output[0].detach())
-                
-                # Register hooks on target layer
+                # Register hook on target layer
                 target_layers = self.get_target_layers(branch)
                 if not target_layers:
                     raise ValueError(f"No target layers found for branch {branch}")
                 
                 forward_handle = target_layers[0].register_forward_hook(forward_hook)
-                backward_handle = target_layers[0].register_full_backward_hook(backward_hook)
                 
                 # Ensure input requires grad
                 input_tensor.requires_grad_(True)
@@ -374,26 +366,35 @@ class AIDE_Model(nn.Module):
                 elif branch == 'sfe':
                     logits = self._forward_sfe_only(input_tensor)
                 
+                # Remove forward hook
+                forward_handle.remove()
+                
+                # Ensure we captured activations
+                if len(activations) == 0:
+                    raise RuntimeError(f"No activations captured for branch {branch}")
+                
                 # Ensure logits require grad
                 if not logits.requires_grad:
                     raise RuntimeError(f"Logits don't require gradients for branch {branch}")
+                
+                # Enable gradient computation on activations
+                activations[0].requires_grad_(True)
+                activations[0].retain_grad()
                 
                 # Backward pass
                 self.zero_grad()
                 score = logits[:, target_class]
                 score.backward(retain_graph=True)
                 
-                # Remove hooks
-                forward_handle.remove()
-                backward_handle.remove()
+                # Get gradient directly from activations
+                grads = activations[0].grad
                 
-                # Check if gradients were captured
-                if len(gradients) == 0:
-                    raise RuntimeError(f"No gradients captured for branch {branch}. Check if backward hook is triggered.")
+                if grads is None:
+                    raise RuntimeError(f"Gradients not computed for branch {branch}")
                 
                 # Compute Grad-CAM++
-                feature_map = activations[0]  # [1, C, H, W]
-                grads = gradients[0]  # [1, C, H, W]
+                feature_map = activations[0].detach()  # [1, C, H, W]
+                grads = grads.detach()  # [1, C, H, W]
                 
                 # Grad-CAM++ weights
                 alpha = grads.pow(2)
@@ -466,6 +467,7 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
 
