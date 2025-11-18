@@ -643,7 +643,7 @@ class AIDE_Model(nn.Module):
         x_max1 = self.model_max(x_maxmax1_hpf)
 
         x_1 = (x_min + x_max + x_min1 + x_max1) / 4
-        x_0 *= 0  # As per original code
+        # x_0 *= 0  # As per original code
 
         # Concatenate features
         x = torch.cat([x_0, x_1], dim=1)
@@ -767,6 +767,7 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
 
