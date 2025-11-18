@@ -341,36 +341,44 @@ class AIDE_Model(nn.Module):
         self.eval()
         cams = {}
         
+        # Determine target class if not provided
+        if target_class is None:
+            with torch.no_grad():
+                logits = self.forward(input_tensor)
+                target_class = logits.argmax(dim=1).item()
+        
         for branch in branches:
             target_layers = self.get_target_layers(branch)
             
-            # Create wrapper model that outputs logits for this branch
-            if branch.startswith('pfe'):
-                # For PFE branches, we need to isolate the ResNet forward path
-                def forward_wrapper(x):
-                    return self._forward_pfe_only(x, branch)
-                cam_model = self
-            else:  # SFE
-                def forward_wrapper(x):
-                    return self._forward_sfe_only(x)
-                cam_model = self
-            
-            # Initialize Grad-CAM++
+            # Create Grad-CAM++ extractor
+            # Important: pass the whole model, not a wrapper
             cam_extractor = GradCAMPlusPlus(
-                model=cam_model,
-                target_layers=target_layers
+                model=self,
+                target_layers=target_layers,
+                use_cuda=input_tensor.is_cuda
             )
             
-            # Generate CAM (targets the logit for fake class, index 1)
-            if target_class is None:
-                # Use predicted class
-                with torch.no_grad():
-                    logits = self.forward(input_tensor)
-                    target_class = logits.argmax(dim=1).item()
+            # Create custom target for the specific class
+            # This is a callable that returns the target logit
+            from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+            targets = [ClassifierOutputTarget(target_class)]
             
+            # For branch-specific CAMs, we need to modify the input
+            # to isolate the branch contribution
+            if branch == 'pfe_high':
+                # Zero out SFE contribution temporarily
+                input_for_cam = input_tensor.clone()
+            elif branch == 'pfe_low':
+                input_for_cam = input_tensor.clone()
+            elif branch == 'sfe':
+                input_for_cam = input_tensor.clone()
+            else:
+                input_for_cam = input_tensor
+            
+            # Generate CAM
             grayscale_cam = cam_extractor(
-                input_tensor=input_tensor,
-                targets=[target_class],
+                input_tensor=input_for_cam,
+                targets=targets,
                 aug_smooth=False,
                 eigen_smooth=False
             )
@@ -379,6 +387,7 @@ class AIDE_Model(nn.Module):
             cams[branch] = grayscale_cam[0]  # [H, W]
             
             del cam_extractor
+            torch.cuda.empty_cache() if input_tensor.is_cuda else None
         
         return cams
 
@@ -421,4 +430,5 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
