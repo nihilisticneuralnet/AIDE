@@ -244,7 +244,7 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
             predictions = torch.cat((predictions, output), 0)
             labels = torch.cat((labels, target), 0)
 
-        # torch.cuda.synchroni?ze()
+        torch.cuda.synchronize()
 
         acc1, acc5 = accuracy(output, target, topk=(1, 2))
 
