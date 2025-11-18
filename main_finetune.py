@@ -141,7 +141,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default=None,
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cpu',
+    parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='',
@@ -182,6 +182,14 @@ def get_args_parser():
     
     parser.add_argument('--use_amp', type=str2bool, default=False, 
                         help="Use apex AMP (Automatic Mixed Precision) or not")
+
+    parser.add_argument('--generate_cams', type=str2bool, default=False,
+                        help='Generate Grad-CAM++ visualizations during evaluation')
+    parser.add_argument('--cam_output_dir', default='./cam_outputs',
+                        help='Directory to save CAM visualizations')
+    parser.add_argument('--cam_samples', type=int, default=100,
+                        help='Number of samples to generate CAMs for (0=all)')
+    
     return parser
 
 def main(args):
