@@ -29,6 +29,59 @@ from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, r
 
 warnings.filterwarnings('ignore')
 
+def save_cam_visualization(rgb_image, cams, file_name, output_dir, pred_prob, true_label, pred_label):
+    """
+    Save CAM visualizations as a grid
+    
+    Args:
+        rgb_image: [3, H, W] tensor
+        cams: dict of {branch: heatmap [H, W]}
+        file_name: str
+        output_dir: str
+        pred_prob: float
+        true_label: int
+        pred_label: int
+    """
+    # Convert RGB image to numpy [H, W, 3] in range [0, 1]
+    rgb_img = rgb_image.permute(1, 2, 0).cpu().numpy()
+    rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-8)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle(f'{file_name}\nPred: {pred_label} ({pred_prob:.3f}) | True: {true_label}', 
+                 fontsize=14)
+    
+    # Original image
+    axes[0, 0].imshow(rgb_img)
+    axes[0, 0].set_title('Original')
+    axes[0, 0].axis('off')
+    
+    # CAM overlays
+    branch_names = ['PFE High-Freq', 'PFE Low-Freq', 'SFE Semantic', 'Fused']
+    branch_keys = ['pfe_high', 'pfe_low', 'sfe', 'fused']
+    positions = [(0, 1), (0, 2), (1, 0), (1, 1)]
+    
+    for (row, col), name, key in zip(positions, branch_names, branch_keys):
+        cam = cams[key]
+        # Resize CAM to match image size
+        cam_resized = cv2.resize(cam, (rgb_img.shape[1], rgb_img.shape[0]))
+        
+        # Create overlay
+        cam_overlay = show_cam_on_image(rgb_img, cam_resized, use_rgb=True)
+        
+        axes[row, col].imshow(cam_overlay)
+        axes[row, col].set_title(name)
+        axes[row, col].axis('off')
+    
+    # Raw fused heatmap
+    axes[1, 2].imshow(cams['fused'], cmap='jet')
+    axes[1, 2].set_title('Fused Heatmap (raw)')
+    axes[1, 2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{file_name}_cam.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Resnet fine-tuning', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -174,6 +227,12 @@ def get_args_parser():
     
     parser.add_argument('--use_amp', type=str2bool, default=False, 
                         help="Use apex AMP (Automatic Mixed Precision) or not")
+    parser.add_argument('--generate_cams', type=str2bool, default=False,
+                        help='Generate Grad-CAM++ visualizations during evaluation')
+    parser.add_argument('--cam_output_dir', default=None, type=str,
+                        help='Directory to save CAM visualizations')
+    parser.add_argument('--num_cam_samples', default=100, type=int,
+                        help='Number of samples to generate CAMs for')
     return parser
 
 def main(args):
@@ -330,7 +389,9 @@ def main(args):
         ground_truths_all = []
         file_names_all = []
         # my code end
-
+        if args.generate_cams and args.cam_output_dir is None:
+            args.cam_output_dir = os.path.join(args.output_dir, 'gradcam_visualizations')
+            
         for v_id, val in enumerate(vals):
             
             args.eval_data_path = os.path.join(args.eval_data_path, val)
@@ -365,10 +426,19 @@ def main(args):
                 drop_last=False
             )
 
-
+            current_cam_dir = None
+            if args.generate_cams:
+                current_cam_dir = os.path.join(args.cam_output_dir, val)
+            
+            test_stats, acc, ap, predictions, ground_truths, cam_results = evaluate(
+                data_loader_val, model, device,
+                generate_cams=args.generate_cams,
+                cam_output_dir=current_cam_dir,
+                num_cam_samples=args.num_cam_samples
+            )
             # test_stats, acc, ap = evaluate(data_loader_val, model, device)
             # test_stats, acc, ap = evaluate(data_loader_val, model, device, distributed=args.distributed)
-            test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
+            # test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
             
             print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
         
@@ -495,8 +565,11 @@ def main(args):
         if data_loader_val is not None:
             # test_stats, acc, ap = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
             # test_stats, acc, ap = evaluate(data_loader_val, model, device, use_amp=args.use_amp, distributed=args.distributed)
-            test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
-            
+            # test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
+            test_stats, acc, ap, predictions, ground_truths, _ = evaluate(
+                data_loader_val, model, device,
+                generate_cams=False  # Don't generate CAMs during training
+            )
             print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%, ap: {ap}.")
             if max_accuracy < test_stats["acc1"]:
                 max_accuracy = test_stats["acc1"]
