@@ -35,3 +35,4 @@ torchmetrics
 torchsummary
 torchvision
 tqdm
+grad-cam
