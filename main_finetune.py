@@ -24,8 +24,7 @@ from utils import str2bool, remap_checkpoint_keys
 import models.AIDE as AIDE
 import csv
 import warnings
-from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-
+from generate_cams import generate_cams_for_dataset, save_cam_visualization
 
 warnings.filterwarnings('ignore')
 
@@ -50,14 +49,6 @@ def get_args_parser():
     parser.add_argument('--model_ema_decay', type=float, default=0.9999, help='')
     parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False, help='')
     parser.add_argument('--model_ema_eval', type=str2bool, default=False, help='Using ema to eval during training.')
-    # Add after the evaluation parameters section
-    parser.add_argument('--enable_gradcam', type=str2bool, default=False,
-                        help='Enable Grad-CAM++ visualization during evaluation')
-    parser.add_argument('--gradcam_layer', type=str, default='pfe_high',
-                        choices=['pfe_high', 'pfe_low', 'sfe'],
-                        help='Target layer for Grad-CAM++')
-    parser.add_argument('--gradcam_save_dir', type=str, default=None,
-                        help='Directory to save Grad-CAM++ visualizations')
 
     # Optimization parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
@@ -141,7 +132,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default=None,
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cpu',
+    parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='',
@@ -165,7 +156,7 @@ def get_args_parser():
                         help='Enabling distributed evaluation')
     parser.add_argument('--disable_eval', type=str2bool, default=False,
                         help='Disabling evaluation during training')
-    parser.add_argument('--num_workers', default=1, type=int)
+    parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--pin_mem', type=str2bool, default=True,
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
 
@@ -175,13 +166,28 @@ def get_args_parser():
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
-    parser.add_argument('--local_rank', '--local-rank', default=-1, type=int)
+    parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', type=str2bool, default=False)
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
     
     parser.add_argument('--use_amp', type=str2bool, default=False, 
                         help="Use apex AMP (Automatic Mixed Precision) or not")
+    # Grad-CAM++ parameters
+    parser.add_argument('--generate_cams', type=str2bool, default=False,
+                        help='Generate Grad-CAM++ visualizations during evaluation')
+    parser.add_argument('--cam_branches', nargs='+', 
+                        default=['pfe_high', 'pfe_low', 'sfe'],
+                        choices=['pfe_high', 'pfe_low', 'sfe'],
+                        help='Branches to compute CAMs for')
+    parser.add_argument('--cam_output_dir', type=str, default=None,
+                        help='Output directory for CAM visualizations')
+    parser.add_argument('--cam_save_raw', type=str2bool, default=True,
+                        help='Save raw CAM heatmaps as .npy files')
+    parser.add_argument('--cam_save_overlay', type=str2bool, default=True,
+                        help='Save CAM overlay visualizations')
+    parser.add_argument('--cam_num_samples', type=int, default=None,
+                        help='Number of samples to generate CAMs for (None for all)')
     return parser
 
 def main(args):
@@ -209,11 +215,6 @@ def main(args):
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True, seed=args.seed,
     )
-
-    # utils.init_distributed_mode(args)
-    # if args.eval and not args.dist_eval:
-    #     args.distributed = False
-    
     print("Sampler_train = %s" % str(sampler_train))
     if args.dist_eval:
         if len(dataset_val) % num_tasks != 0:
@@ -332,28 +333,12 @@ def main(args):
 
         rows = [["{} model testing on...".format(args.resume)],
             ['testset', 'accuracy', 'avg precision']]
-        
-        # my code for maintaining lists of all predicitons and ground truths
-        predictions_all = []
-        ground_truths_all = []
-        file_names_all = []
-        # my code end
 
         for v_id, val in enumerate(vals):
             
             args.eval_data_path = os.path.join(args.eval_data_path, val)
             dataset_val = TestDataset(is_train=False, args=args)
             args.eval_data_path = eval_data_path
-            
-            # get file names
-            try:
-                # Get just the base filename from the full path
-                current_filenames = [os.path.basename(sample['image_path']) for sample in dataset_val.data_list]
-            except AttributeError:
-                print("Warning: Could not find .samples attribute in TestDataset.")
-                print("File names will not be saved. You may need to modify the code to access your dataset's file list.")
-                # Create dummy filenames if not found, to avoid crashing
-                current_filenames = [f'unknown_file_{i}' for i in range(len(dataset_val))]
 
             if args.dist_eval:
                 if len(dataset_val) % num_tasks != 0:
@@ -374,19 +359,27 @@ def main(args):
             )
 
 
-            # test_stats, acc, ap = evaluate(data_loader_val, model, device)
-            # test_stats, acc, ap = evaluate(data_loader_val, model, device, distributed=args.distributed)
-            test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
-            
+            test_stats, acc, ap = evaluate(data_loader_val, model, device)
+            if args.generate_cams:
+                cam_out_dir = args.cam_output_dir or os.path.join(args.output_dir, 'cams', val)
+                print(f"Generating Grad-CAM++ visualizations for {val}...")
+                generate_cams_for_dataset(
+                    model=model_without_ddp if args.distributed else model,
+                    dataloader=data_loader_val,
+                    device=device,
+                    output_dir=cam_out_dir,
+                    branches=args.cam_branches,
+                    save_raw=args.cam_save_raw,
+                    save_overlay=args.cam_save_overlay,
+                    save_fused=True
+                )
+                print(f"CAM visualizations saved to {cam_out_dir}")
             print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
         
             print(f"test dataset is {val} acc: {acc}, ap: {ap}")
             print("***********************************")
 
             rows.append([val, acc, ap])
-            predictions_all.extend(predictions)
-            ground_truths_all.extend(ground_truths)
-            file_names_all.extend(current_filenames)
 
 
         test_dataset_name  = args.eval_data_path.split('/')[-2]
@@ -395,86 +388,6 @@ def main(args):
         with open(csv_name, 'w') as f:
             csv_writer = csv.writer(f, delimiter=',')
             csv_writer.writerows(rows)
-            
-            
-        # my code to save csv for predictions_all and ground_truths_all
-        # --- Convert probabilities to binary classes ---
-        threshold = 0.5
-        predictions_binary = [1 if p >= threshold else 0 for p in predictions_all]
-
-        # --- 1. Classify each individual prediction ---
-        # This new block determines if each row is a TP, TN, FP, or FN
-        classifications = []
-        for pred, truth in zip(predictions_binary, ground_truths_all):
-            if pred == 1 and truth == 1:
-                classifications.append('TP') # True Positive
-            elif pred == 0 and truth == 0:
-                classifications.append('TN') # True Negative
-            elif pred == 1 and truth == 0:
-                classifications.append('FP') # False Positive
-            else: # pred == 0 and truth == 1
-                classifications.append('FN') # False Negative
-
-        # --- 2. Calculate Aggregate Metrics ---
-        # This part remains the same, but it's good to confirm it's using the binary predictions.
-        tn, fp, fn, tp = confusion_matrix(ground_truths_all, predictions_binary).ravel()
-
-        accuracy = accuracy_score(ground_truths_all, predictions_binary)
-        precision = precision_score(ground_truths_all, predictions_binary, zero_division=0)
-        recall = recall_score(ground_truths_all, predictions_binary, zero_division=0)
-        f1 = f1_score(ground_truths_all, predictions_binary, zero_division=0)
-
-
-        # --- 3. Write Everything to CSV File ---
-        results_csv_file_path = os.path.join(args.output_dir, 'results_with_metrics.csv')
-
-        # Combine all the per-prediction data into rows
-        prediction_rows = zip(
-            file_names_all,       # The list of file names
-            predictions_all,      # The original probability
-            ground_truths_all,    # The true label
-            predictions_binary,   # The binarized prediction (0 or 1)
-            classifications       # The classification label ('TP', 'FN', etc.)
-        )
-
-        # Prepare the summary metrics data
-        metrics_data = [
-            ['Metric', 'Value'],
-            ['Threshold', threshold],
-            ['True Positive (TP)', tp],
-            ['True Negative (TN)', tn],
-            ['False Positive (FP)', fp],
-            ['False Negative (FN)', fn],
-            ['Accuracy', f'{accuracy:.4f}'],
-            ['Precision', f'{precision:.4f}'],
-            ['Recall (Sensitivity)', f'{recall:.4f}'],
-            ['F1-Score', f'{f1:.4f}']
-        ]
-
-        with open(results_csv_file_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            
-            # Write the updated header for the per-prediction results
-            writer.writerow([
-                'file_name', 
-                'prediction_probability', 
-                'ground_truth', 
-                'prediction_binary', 
-                'classification'
-            ])
-            writer.writerows(prediction_rows)
-            
-            # Add a blank row for separation
-            writer.writerow([]) 
-            
-            # Write the summary metrics
-            writer.writerows(metrics_data)
-
-        print(f"✅ Data and metrics successfully saved to {results_csv_file_path}")
-        # my code end
-        
-            
-            
         return
     
     max_accuracy = 0.0
@@ -501,10 +414,7 @@ def main(args):
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
         if data_loader_val is not None:
-            # test_stats, acc, ap = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
-            # test_stats, acc, ap = evaluate(data_loader_val, model, device, use_amp=args.use_amp, distributed=args.distributed)
-            test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
-            
+            test_stats, acc, ap = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
             print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%, ap: {ap}.")
             if max_accuracy < test_stats["acc1"]:
                 max_accuracy = test_stats["acc1"]
@@ -526,9 +436,7 @@ def main(args):
             
             # repeat testing routines for EMA, if ema eval is turned on
             if args.model_ema and args.model_ema_eval:
-                # test_stats_ema, acc, ap = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp)
-                # test_stats_ema, acc, ap = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp, distributed=args.distributed)
-                test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
+                test_stats_ema, acc, ap = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp)
                 print(f"Accuracy of the model EMA on {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%, ap: {ap}")
                 if max_accuracy_ema < test_stats_ema["acc1"]:
                     max_accuracy_ema = test_stats_ema["acc1"]
