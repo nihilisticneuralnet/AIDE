@@ -1,11 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-
 import argparse
 import datetime
 import numpy as np
@@ -141,7 +133,7 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default=None,
                         help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda',
+    parser.add_argument('--device', default='cpu',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='',
@@ -182,14 +174,6 @@ def get_args_parser():
     
     parser.add_argument('--use_amp', type=str2bool, default=False, 
                         help="Use apex AMP (Automatic Mixed Precision) or not")
-
-    parser.add_argument('--generate_cams', type=str2bool, default=False,
-                        help='Generate Grad-CAM++ visualizations during evaluation')
-    parser.add_argument('--cam_output_dir', default='./cam_outputs',
-                        help='Directory to save CAM visualizations')
-    parser.add_argument('--cam_samples', type=int, default=100,
-                        help='Number of samples to generate CAMs for (0=all)')
-    
     return parser
 
 def main(args):
@@ -330,8 +314,7 @@ def main(args):
 
     if args.eval:
         print(f"Eval only mode")
-        if args.generate_cams:
-            os.makedirs(args.cam_output_dir, exist_ok=True)
+        
         vals = os.listdir(args.eval_data_path)
         if len(vals) == 16:
             vals = ["progan", "stylegan", "biggan", "cyclegan", "stargan", "gaugan", "stylegan2", "whichfaceisreal", "ADM", "Glide", "Midjourney", "stable_diffusion_v_1_4", "stable_diffusion_v_1_5", "VQDM", "wukong", "DALLE2"]
@@ -353,10 +336,6 @@ def main(args):
             args.eval_data_path = os.path.join(args.eval_data_path, val)
             dataset_val = TestDataset(is_train=False, args=args)
             args.eval_data_path = eval_data_path
-            cam_subdir = None
-            if args.generate_cams:
-                cam_subdir = os.path.join(args.cam_output_dir, val)
-                os.makedirs(cam_subdir, exist_ok=True)
             
             # get file names
             try:
@@ -389,14 +368,7 @@ def main(args):
 
             # test_stats, acc, ap = evaluate(data_loader_val, model, device)
             # test_stats, acc, ap = evaluate(data_loader_val, model, device, distributed=args.distributed)
-            # test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
-            test_stats, acc, ap, predictions, ground_truths = evaluate(
-                data_loader_val, 
-                model, 
-                device,
-                generate_cams=args.generate_cams,
-                cam_output_dir=cam_subdir
-            )
+            test_stats, acc, ap, predictions, ground_truths = evaluate(data_loader_val, model, device)
             
             print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
         
