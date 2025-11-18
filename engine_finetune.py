@@ -84,7 +84,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 if model_ema is not None:
                     model_ema.update(model)
         
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
         if mixup_fn is None:
             class_acc = (output.max(-1)[-1] == targets).float().mean()
@@ -240,7 +240,7 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False):
             predictions = torch.cat((predictions, output), 0)
             labels = torch.cat((labels, target), 0)
 
-        torch.cuda.synchronize()
+        # torch.cuda.synchroni?ze()
 
         acc1, acc5 = accuracy(output, target, topk=(1, 2))
 
