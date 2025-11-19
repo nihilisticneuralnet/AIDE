@@ -854,19 +854,25 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 
-def evaluate(data_loader, model, device, use_amp=False, distributed=False, 
+@torch.no_grad()
+def evaluate(data_loader, model, device, use_amp=False, distributed=False,
              generate_cams=False, cam_output_dir=None, num_cam_samples=100):
     """
     Evaluate the model and optionally generate Grad-CAM++ visualizations.
+    Gradients are only enabled for CAM generation; metrics are computed with torch.no_grad().
     """
+    import os
+
     criterion = torch.nn.CrossEntropyLoss()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
 
-    model.eval()  # switch to evaluation mode
-
+    model.eval()
     predictions, labels = [], []
 
+    # ------------------------
+    # 1. Normal evaluation
+    # ------------------------
     for index, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
         images = batch[0].to(device, non_blocking=True)
         target = batch[-1].to(device, non_blocking=True)
@@ -894,11 +900,10 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
 
-    # Concatenate all predictions/labels
     predictions = torch.cat(predictions, dim=0)
     labels = torch.cat(labels, dim=0)
 
-    # Handle distributed
+    # Distributed gather if needed
     if distributed and utils.is_dist_avail_and_initialized():
         output_ddp = [torch.zeros_like(predictions) for _ in range(utils.get_world_size())]
         dist.all_gather(output_ddp, predictions)
@@ -919,7 +924,9 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
 
     cam_results = None
 
-    # Generate Grad-CAM++ if requested
+    # ------------------------
+    # 2. Grad-CAM++ generation
+    # ------------------------
     if generate_cams and cam_output_dir is not None:
         os.makedirs(cam_output_dir, exist_ok=True)
         cam_results = {'pfe_high': [], 'pfe_low': [], 'sfe': [], 'fused': []}
@@ -928,11 +935,12 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
         total_cam_count = 0
 
         model.eval()
-        torch.set_grad_enabled(True)  # enable gradients for CAMs
+        torch.set_grad_enabled(True)  # Enable gradients for CAMs
 
         for batch in data_loader:
             if total_cam_count >= num_cam_samples:
                 break
+
             images = batch[0].to(device)
             target = batch[-1].to(device)
             file_names = batch[2] if len(batch) > 2 else None
@@ -941,6 +949,7 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
             for i in range(batch_size):
                 if total_cam_count >= num_cam_samples:
                     break
+
                 single_image = images[i:i+1]  # [1,5,C,H,W]
                 single_target = target[i].item()
 
@@ -963,42 +972,32 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
                     continue
 
                 # Generate CAMs
-                try:
-                    if hasattr(model, 'module'):  # DDP
-                        cams = model.module.generate_gradcam(single_image, target_classes=single_target)
-                    else:
-                        cams = model.generate_gradcam(single_image, target_classes=single_target)
+                cams = model.module.generate_gradcam(single_image, target_class=single_target) \
+                    if hasattr(model, 'module') else model.generate_gradcam(single_image, target_classes=single_target)
 
-                    fused_cam = np.mean([cams['pfe_high'], cams['pfe_low'], cams['sfe']], axis=0)
-                    cams['fused'] = fused_cam
+                fused_cam = np.mean([cams['pfe_high'], cams['pfe_low'], cams['sfe']], axis=0)
+                cams['fused'] = fused_cam
 
-                    # Save per-branch CAMs
-                    for branch in ['pfe_high', 'pfe_low', 'sfe', 'fused']:
-                        cam_results[branch].append(cams[branch])
+                for branch in ['pfe_high', 'pfe_low', 'sfe', 'fused']:
+                    cam_results[branch].append(cams[branch])
 
-                    # Save visualization
-                    file_name = file_names[i] if file_names else f"sample_{total_cam_count}"
-                    file_name_with_category = f"{category}_{file_name}"
-                    save_cam_visualization(
-                        single_image[0, 4].cpu(),  # RGB token
-                        cams,
-                        file_name_with_category,
-                        cam_output_dir,
-                        pred_prob,
-                        single_target,
-                        pred_class
-                    )
+                # Save visualization
+                file_name = file_names[i] if file_names else f"sample_{total_cam_count}"
+                save_cam_visualization(
+                    single_image[0, 4].cpu(),
+                    cams,
+                    f"{category}_{file_name}",
+                    cam_output_dir,
+                    pred_prob,
+                    single_target,
+                    pred_class
+                )
 
-                    cam_counts[category] += 1
-                    total_cam_count += 1
-
-                except Exception as e:
-                    print(f"Error generating CAM for sample {total_cam_count}: {e}")
-                    continue
+                cam_counts[category] += 1
+                total_cam_count += 1
 
         torch.set_grad_enabled(False)
         print(f"✅ Generated {total_cam_count} Grad-CAM++ visualizations in {cam_output_dir}")
         print(f"TP: {cam_counts['TP']}, TN: {cam_counts['TN']}, FP: {cam_counts['FP']}, FN: {cam_counts['FN']}")
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true, cam_results
-
