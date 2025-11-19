@@ -460,7 +460,8 @@ class AIDE_Model(nn.Module):
             # end branch loop
     
         # stack per branch into arrays [B, H, W]
-        for branch in camps := list(cams_out.keys()):
+        camps = list(cams_out.keys())
+        for branch in camps:
             cams_out[branch] = np.stack(cams_out[branch], axis=0)
     
         return cams_out
@@ -506,6 +507,7 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
 
