@@ -930,61 +930,55 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
     if generate_cams and cam_output_dir is not None:
         os.makedirs(cam_output_dir, exist_ok=True)
         cam_results = {'pfe_high': [], 'pfe_low': [], 'sfe': [], 'fused': []}
-        cam_counts = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
+        cam_counts = {'TP':0,'TN':0,'FP':0,'FN':0}
         samples_per_category = num_cam_samples // 4
         total_cam_count = 0
-
+    
         model.eval()
-        torch.set_grad_enabled(True)  # Enable gradients for CAMs
-
+        torch.set_grad_enabled(True)
+    
         for batch in data_loader:
             if total_cam_count >= num_cam_samples:
                 break
-
+    
             images = batch[0].to(device)
             target = batch[-1].to(device)
             file_names = batch[2] if len(batch) > 2 else None
             batch_size = images.shape[0]
-
+    
             for i in range(batch_size):
                 if total_cam_count >= num_cam_samples:
                     break
-
-                single_image = images[i:i+1]  # [1,5,C,H,W]
-                single_target = target[i].item()
-
-                # Forward pass with gradients enabled
+    
+                single_image = images[i:i+1]
+                single_target = int(target[i].item())
+    
                 logits = model(single_image)
                 pred_class = logits.argmax(dim=1).item()
-                pred_prob = torch.softmax(logits, dim=1)[0, 1].item()
-
+                pred_prob = torch.softmax(logits, dim=1)[0,1].item()
+    
                 # Determine category
-                if single_target == 1 and pred_class == 1:
-                    category = 'TP'
-                elif single_target == 0 and pred_class == 0:
-                    category = 'TN'
-                elif single_target == 0 and pred_class == 1:
-                    category = 'FP'
-                elif single_target == 1 and pred_class == 0:
-                    category = 'FN'
-
-                if cam_counts[category] >= samples_per_category:
+                if single_target==1 and pred_class==1: category='TP'
+                elif single_target==0 and pred_class==0: category='TN'
+                elif single_target==0 and pred_class==1: category='FP'
+                elif single_target==1 and pred_class==0: category='FN'
+    
+                if cam_counts[category]>=samples_per_category:
                     continue
-
-                # Generate CAMs
+    
+                # Generate CAMs — single_target as int
                 cams = model.module.generate_gradcam(single_image, target_class=single_target) \
-                    if hasattr(model, 'module') else model.generate_gradcam(single_image, target_classes=single_target)
-
+                    if hasattr(model,'module') else model.generate_gradcam(single_image, target_class=single_target)
+    
                 fused_cam = np.mean([cams['pfe_high'], cams['pfe_low'], cams['sfe']], axis=0)
                 cams['fused'] = fused_cam
-
-                for branch in ['pfe_high', 'pfe_low', 'sfe', 'fused']:
+    
+                for branch in ['pfe_high','pfe_low','sfe','fused']:
                     cam_results[branch].append(cams[branch])
-
-                # Save visualization
+    
                 file_name = file_names[i] if file_names else f"sample_{total_cam_count}"
                 save_cam_visualization(
-                    single_image[0, 4].cpu(),
+                    single_image[0,4].cpu(),
                     cams,
                     f"{category}_{file_name}",
                     cam_output_dir,
@@ -992,11 +986,12 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
                     single_target,
                     pred_class
                 )
-
-                cam_counts[category] += 1
-                total_cam_count += 1
-
+    
+                cam_counts[category]+=1
+                total_cam_count+=1
+    
         torch.set_grad_enabled(False)
+
         print(f"✅ Generated {total_cam_count} Grad-CAM++ visualizations in {cam_output_dir}")
         print(f"TP: {cam_counts['TP']}, TN: {cam_counts['TN']}, FP: {cam_counts['FP']}, FN: {cam_counts['FN']}")
 
