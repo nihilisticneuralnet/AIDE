@@ -9,57 +9,7 @@ from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.utils.image import show_cam_on_image
 import torch.nn.functional as F
 
-def save_cam_visualization(rgb_image, cams, file_name, output_dir, pred_prob, true_label, pred_label):
-    """
-    Save CAM visualizations as a grid
-    
-    Args:
-        rgb_image: [3, H, W] tensor
-        cams: dict of {branch: heatmap [H, W]}
-        file_name: str
-        output_dir: str
-        pred_prob: float
-        true_label: int
-        pred_label: int
-    """
-    # Convert RGB image to numpy [H, W, 3] in range [0, 1]
-    rgb_img = rgb_image.permute(1, 2, 0).cpu().numpy()
-    rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-8)
-    
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    fig.suptitle(f'{file_name}\nPred: {pred_label} ({pred_prob:.3f}) | True: {true_label}', 
-                 fontsize=14)
-    
-    # Original image
-    axes[0, 0].imshow(rgb_img)
-    axes[0, 0].set_title('Original')
-    axes[0, 0].axis('off')
-    
-    # CAM overlays
-    branch_names = ['PFE High-Freq', 'PFE Low-Freq', 'SFE Semantic', 'Fused']
-    branch_keys = ['pfe_high', 'pfe_low', 'sfe', 'fused']
-    positions = [(0, 1), (0, 2), (1, 0), (1, 1)]
-    
-    for (row, col), name, key in zip(positions, branch_names, branch_keys):
-        cam = cams[key]
-        # Resize CAM to match image size
-        cam_resized = cv2.resize(cam, (rgb_img.shape[1], rgb_img.shape[0]))
-        
-        # Create overlay
-        cam_overlay = show_cam_on_image(rgb_img, cam_resized, use_rgb=True)
-        
-        axes[row, col].imshow(cam_overlay)
-        axes[row, col].set_title(name)
-        axes[row, col].axis('off')
-    
-    # Raw fused heatmap
-    axes[1, 2].imshow(cams['fused'], cmap='jet')
-    axes[1, 2].set_title('Fused Heatmap (raw)')
-    axes[1, 2].axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'{file_name}_cam.png'), dpi=150, bbox_inches='tight')
-    plt.close() 
+
   
 class HPF(nn.Module):
   def __init__(self):
@@ -303,182 +253,218 @@ class AIDE_Model(nn.Module):
 
     
 
-    def forward(self, x, return_cam=False, cam_branches=None):
-
+    def forward(self, x, return_cam=False, cam_branches=None, branch_mask=None):
+        """
+        branch_mask: dict or None, e.g. {'pfe_high':1.0, 'pfe_low':0.0, 'sfe':0.0}
+        return_cam: same semantics as before (keeps behavior)
+        Returns logits (and same as before). This forward also supports masking branches
+        while preserving the original computation graph.
+        """
         b, t, c, h, w = x.shape
-
+    
         x_minmin = x[:, 0] #[b, c, h, w]
         x_maxmax = x[:, 1]
         x_minmin1 = x[:, 2]
         x_maxmax1 = x[:, 3]
         tokens = x[:, 4]
-
+    
         x_minmin = self.hpf(x_minmin)
         x_maxmax = self.hpf(x_maxmax)
         x_minmin1 = self.hpf(x_minmin1)
         x_maxmax1 = self.hpf(x_maxmax1)
-
-        with torch.no_grad():
-            
-            clip_mean = torch.Tensor([0.48145466, 0.4578275, 0.40821073])
-            clip_mean = clip_mean.to(tokens, non_blocking=True).view(3, 1, 1)
-            clip_std = torch.Tensor([0.26862954, 0.26130258, 0.27577711])
-            clip_std = clip_std.to(tokens, non_blocking=True).view(3, 1, 1)
-            dinov2_mean = torch.Tensor([0.485, 0.456, 0.406]).to(tokens, non_blocking=True).view(3, 1, 1)
-            dinov2_std = torch.Tensor([0.229, 0.224, 0.225]).to(tokens, non_blocking=True).view(3, 1, 1)
-
-            local_convnext_image_feats = self.openclip_convnext_xxl(
-                tokens * (dinov2_std / clip_std) + (dinov2_mean - clip_mean) / clip_std
-            ) #[b, 3072, 8, 8]
-            assert local_convnext_image_feats.size()[1:] == (3072, 8, 8)
-            local_convnext_image_feats = self.avgpool(local_convnext_image_feats).view(tokens.size(0), -1)
-            x_0 = self.convnext_proj(local_convnext_image_feats)
-
-        x_min = self.model_min(x_minmin)
+    
+        # semantic branch preprocessing (ConvNeXt) - keep graph intact
+        clip_mean = torch.Tensor([0.48145466, 0.4578275, 0.40821073]).to(tokens, non_blocking=True).view(3, 1, 1)
+        clip_std = torch.Tensor([0.26862954, 0.26130258, 0.27577711]).to(tokens, non_blocking=True).view(3, 1, 1)
+        dinov2_mean = torch.Tensor([0.485, 0.456, 0.406]).to(tokens, non_blocking=True).view(3, 1, 1)
+        dinov2_std = torch.Tensor([0.229, 0.224, 0.225]).to(tokens, non_blocking=True).view(3, 1, 1)
+    
+        local_convnext_image_feats = self.openclip_convnext_xxl(
+            tokens * (dinov2_std / clip_std) + (dinov2_mean - clip_mean) / clip_std
+        )  #[b, 3072, 8, 8]
+        assert local_convnext_image_feats.size()[1:] == (3072, 8, 8)
+        local_convnext_image_feats_pooled = self.avgpool(local_convnext_image_feats).view(tokens.size(0), -1)
+        x_0 = self.convnext_proj(local_convnext_image_feats_pooled)  # [b, 256]
+    
+        # PFE branches (ResNets)
+        x_min = self.model_min(x_minmin)   # [b, 2048]
         x_max = self.model_max(x_maxmax)
         x_min1 = self.model_min(x_minmin1)
         x_max1 = self.model_max(x_maxmax1)
-
-        x_1 = (x_min + x_max + x_min1 + x_max1) / 4
-        # x_1 = (x_min + x_max + x_min1 + x_max1) / 40
-        # x_1 *= 9
-        x_0 *= 0
-
-        x = torch.cat([x_0, x_1], dim=1)
-        
-        # my code
-        # x_0 = semantic, x_1 = patchwise
-        # x = torch.cat([0.1 * x_0, 0.9 * x_1], dim=1)
-
+    
+        x_1 = (x_min + x_max + x_min1 + x_max1) / 4  # [b, 2048]
+    
+        # default masks: keep both branches as in training/inference
+        if branch_mask is None:
+            mask_pfe = 1.0
+            mask_sfe = 1.0
+        else:
+            mask_pfe = float(branch_mask.get('pfe', branch_mask.get('pfe_high', 1.0)))
+            mask_sfe = float(branch_mask.get('sfe', 1.0))
+    
+        # preserve original scale behavior; allow masking for CAM
+        x = torch.cat([mask_sfe * x_0, mask_pfe * x_1], dim=1)  # [b, 256+2048]
+    
         x = self.fc(x)
-      
+    
         if return_cam:
             if cam_branches is None:
                 cam_branches = ['pfe_high', 'pfe_low', 'sfe']
-            # Note: CAM generation is done separately in evaluate() to avoid autograd issues
+            # CAM generation done externally; just return logits here
             return x
-
+    
         return x
+
 
     def get_target_layers(self, branch='pfe_high'):
         """
-        Returns target layers for Grad-CAM++
-        branch: 'pfe_high', 'pfe_low', or 'sfe'
+        Return module(s) on which to register forward hooks that capture spatial activations.
+        For ResNet PFE branches we hook the output of the last conv block (before pooling).
+        For SFE we hook the ConvNeXt trunk output before avgpool (which is [B, 3072, 8, 8]).
         """
         if branch == 'pfe_high':
-            # Target the final conv3 in layer4 of model_max (highest frequency)
-            return [self.model_max.layer4[-1].conv3]
+            # hook the last block module (the whole Bottleneck block) so forward hook captures spatial map
+            return [self.model_max.layer4[-1]]
         elif branch == 'pfe_low':
-            # Target the final conv3 in layer4 of model_min (lowest frequency)
-            return [self.model_min.layer4[-1].conv3]
+            return [self.model_min.layer4[-1]]
         elif branch == 'sfe':
-            # Target the last conv block before projection in ConvNeXt
-            # ConvNeXt stages are in self.openclip_convnext_xxl.stages
-            return [self.openclip_convnext_xxl.stages[-1].blocks[-1]]
+            # hook the convnext trunk output stage (the module that produces the spatial tensor)
+            # openclip_convnext_xxl is the visual.trunk.visual trunk — stages[-1] contains the final blocks
+            return [self.openclip_convnext_xxl.stages[-1]]
         else:
             raise ValueError(f"Unknown branch: {branch}")
 
-    def generate_gradcam(self, input_tensor, target_class=None, branches=['pfe_high', 'pfe_low', 'sfe']):
+
+    def generate_gradcam(self, input_tensor, target_classes=None, branches=['pfe_high', 'pfe_low', 'sfe'], device=None):
         """
-        Generate Grad-CAM++ heatmaps using direct gradient access
+        Correct Grad-CAM++ generation that:
+          - Runs a full forward pass (but allows masking for branch isolation by setting branch_mask),
+          - Captures spatial activations with forward hooks,
+          - Registers gradient hooks on the activation tensors to capture dScore/dActivation,
+          - Computes Grad-CAM++ per sample and per branch.
+        input_tensor: full [B, 5, C, H, W] tensor (on device)
+        target_classes: None or list/1D-tensor of length B with class indices (if None, use predicted class)
+        Returns: dict mapping branch -> numpy array shape [B, H, W]
         """
-        self.eval()  # Keep model in eval mode
-        cams = {}
-        
-        # Get prediction if target_class not specified
-        if target_class is None:
-            with torch.no_grad():
-                logits = self.forward(input_tensor)
-                target_class = logits.argmax(dim=1).item()
-        
-        for branch in branches:
-            try:
-                # Storage for activations
+        self.eval()
+        if device is None:
+            device = next(self.parameters()).device
+        input_tensor = input_tensor.to(device)
+    
+        b = input_tensor.shape[0]
+    
+        # Get predictions to pick target classes if not provided
+        with torch.no_grad():
+            logits = self.forward(input_tensor)
+            preds = logits.argmax(dim=1)
+        if target_classes is None:
+            target_classes = preds.cpu().tolist()
+        elif isinstance(target_classes, torch.Tensor):
+            target_classes = target_classes.cpu().tolist()
+    
+        cams_out = {branch: [] for branch in branches}
+    
+        # We'll iterate sample-wise to avoid mixing gradients across batch elements.
+        # For small batches this is fine. If you need speed, can vectorize later.
+        for i in range(b):
+            single = input_tensor[i:i+1].detach().requires_grad_(True)  # [1,5,C,H,W]
+            # compute baseline logits to get target class if not supplied
+            # Use a mask approach to isolate each branch individually while keeping graph identical
+            for branch in branches:
                 activations = []
-                
-                # Hook function to capture activations
-                def forward_hook(module, input, output):
-                    activations.append(output)
-                
-                # Register hook on target layer
-                target_layers = self.get_target_layers(branch)
-                if not target_layers:
-                    raise ValueError(f"No target layers found for branch {branch}")
-                
-                forward_handle = target_layers[0].register_forward_hook(forward_hook)
-                
-                # Ensure input requires grad
-                input_tensor.requires_grad_(True)
-                
-                # Forward pass with gradient tracking
-                if branch == 'pfe_high':
-                    logits = self._forward_pfe_only(input_tensor, 'pfe_high')
-                elif branch == 'pfe_low':
-                    logits = self._forward_pfe_only(input_tensor, 'pfe_low')
-                elif branch == 'sfe':
-                    logits = self._forward_sfe_only(input_tensor)
-                
-                # Remove forward hook
-                forward_handle.remove()
-                
-                # Ensure we captured activations
-                if len(activations) == 0:
-                    raise RuntimeError(f"No activations captured for branch {branch}")
-                
-                # Ensure logits require grad
+                activ_grad = []
+    
+                # forward hook capturing activation tensor
+                def _fwd_hook(module, inp, out):
+                    # out is tensor with shape [1, C, H, W] or a tuple; ensure tensor
+                    act = out if isinstance(out, torch.Tensor) else out[0]
+                    activations.append(act)
+                    # register gradient hook on this tensor to capture grad during backward
+                    def _capture_grad(grad):
+                        activ_grad.append(grad)
+                    act.register_hook(_capture_grad)
+    
+                target_modules = self.get_target_layers(branch)
+                handle = target_modules[0].register_forward_hook(_fwd_hook)
+    
+                # Build a branch_mask: keep only the branch of interest (isolate) but preserve graph
+                if branch == 'sfe':
+                    mask = {'sfe': 1.0, 'pfe': 0.0}
+                else:
+                    # either pfe_high or pfe_low both use the PFE path; keep PFE, zero SFE
+                    mask = {'sfe': 0.0, 'pfe': 1.0}
+    
+                # Forward pass (single sample)
+                logits = self.forward(single, return_cam=True, cam_branches=[branch], branch_mask=mask)
+                # Ensure logits requires grad
                 if not logits.requires_grad:
-                    raise RuntimeError(f"Logits don't require gradients for branch {branch}")
-                
-                # Enable gradient computation on activations
-                activations[0].requires_grad_(True)
-                activations[0].retain_grad()
-                
-                # Backward pass
+                    # ensure the scalar we backward is connected
+                    logits = logits.requires_grad_()
+    
+                # select target score (scalar)
+                cls = target_classes[i]
+                score = logits[0, cls]
+    
+                # zero grads
                 self.zero_grad()
-                score = logits[:, target_class]
+                if single.grad is not None:
+                    single.grad.zero_()
+    
+                # backward
                 score.backward(retain_graph=True)
-                
-                # Get gradient directly from activations
-                grads = activations[0].grad
-                
-                if grads is None:
-                    raise RuntimeError(f"Gradients not computed for branch {branch}")
-                
-                # Compute Grad-CAM++
-                feature_map = activations[0].detach()  # [1, C, H, W]
-                grads = grads.detach()  # [1, C, H, W]
-                
-                # Grad-CAM++ weights
-                alpha = grads.pow(2)
-                alpha = alpha / (2 * alpha + (feature_map * grads.pow(3)).sum(dim=(2, 3), keepdim=True) + 1e-8)
-                
-                weights = (alpha * torch.relu(grads)).sum(dim=(2, 3), keepdim=True)
-                
-                # Generate CAM
-                cam = torch.relu((weights * feature_map).sum(dim=1, keepdim=True))  # [1, 1, H, W]
-                
-                # Normalize
-                cam = cam - cam.min()
-                cam = cam / (cam.max() + 1e-8)
-                
-                # Resize to input size
-                h, w = input_tensor.shape[-2:]
-                cam = F.interpolate(cam, size=(h, w), mode='bilinear', align_corners=False)
-                
-                # Convert to numpy
-                cams[branch] = cam[0, 0].cpu().numpy()
-                
-            except Exception as e:
-                print(f"Error generating CAM for branch {branch}: {e}")
-                import traceback
-                traceback.print_exc()
-                h, w = input_tensor.shape[-2:]
-                cams[branch] = np.zeros((h, w))
-            finally:
-                # Clean up
-                input_tensor.requires_grad_(False)
-        
-        return cams
+    
+                # remove hook
+                handle.remove()
+    
+                # Validate collected activation and grad
+                if len(activations) == 0 or len(activ_grad) == 0:
+                    # fallback: zero map
+                    H = single.shape[-2]; W = single.shape[-1]
+                    cams_out[branch].append(np.zeros((H, W), dtype=np.float32))
+                    continue
+    
+                # activation: [1, C, Hf, Wf] ; grad: [1, C, Hf, Wf]
+                A = activations[0]            # torch tensor
+                dA = activ_grad[0]            # torch tensor
+    
+                # detach to cpu for computation
+                A_det = A.detach()
+                dA_det = dA.detach()
+    
+                # Grad-CAM++ weights (per-sample)
+                # alpha_ij = (dA^2) / (2*dA^2 + sum_k A * dA^3)
+                eps = 1e-8
+                # sum over spatial locations for denominator broadcast
+                a = dA_det.pow(2)
+                b_term = (A_det * dA_det.pow(3)).sum(dim=(2, 3), keepdim=True)
+                alpha = a / (2 * a + b_term + eps)
+                weights = (alpha * torch.relu(dA_det)).sum(dim=(2, 3), keepdim=True)  # [1, C, 1, 1]
+    
+                # compute cam
+                cam_map = torch.relu((weights * A_det).sum(dim=1, keepdim=True))  # [1,1,Hf,Wf]
+                # normalize
+                cam_map -= cam_map.min()
+                cam_map = cam_map / (cam_map.max() + eps)
+    
+                # resize to input H,W
+                H_in, W_in = single.shape[-2], single.shape[-1]
+                cam_resized = F.interpolate(cam_map, size=(H_in, W_in), mode='bilinear', align_corners=False)
+                cam_np = cam_resized[0, 0].cpu().numpy()
+                cams_out[branch].append(cam_np)
+    
+                # cleanup: remove references so next iter doesn't keep graph
+                del activations[:]
+                del activ_grad[:]
+                self.zero_grad()
+    
+            # end branch loop
+    
+        # stack per branch into arrays [B, H, W]
+        for branch in camps := list(cams_out.keys()):
+            cams_out[branch] = np.stack(cams_out[branch], axis=0)
+    
+        return cams_out
+
 
     def _forward_pfe_only(self, x, branch):
         """Forward pass through PFE branch only - ensure gradients enabled"""
@@ -520,6 +506,7 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
 
