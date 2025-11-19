@@ -31,6 +31,99 @@ import cv2
 import numpy as np
 import os
 
+def save_cam_visualization(rgb_image, cams, file_name, output_dir, pred_prob, true_label, pred_label):
+    """
+    Save CAM visualizations as a grid and individual images
+    Args:
+        rgb_image: [3, H, W] tensor
+        cams: dict of {branch: heatmap [H, W]}
+        file_name: str (now includes category prefix like "TP_", "FP_", etc.)
+        output_dir: str
+        pred_prob: float
+        true_label: int
+        pred_label: int
+    """
+    # Determine category from filename for title
+    category = file_name.split('_')[0] if file_name.startswith(('TP', 'TN', 'FP', 'FN')) else ''
+    category_full = {
+        'TP': 'True Positive',
+        'TN': 'True Negative', 
+        'FP': 'False Positive',
+        'FN': 'False Negative'
+    }.get(category, '')
+    
+    # Convert RGB image to numpy [H, W, 3] in range [0, 1]
+    rgb_img = rgb_image.permute(1, 2, 0).cpu().numpy()
+    rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-8)
+    
+    # Create output directory for individual images
+    individual_dir = os.path.join(output_dir, f'{file_name}_individual')
+    os.makedirs(individual_dir, exist_ok=True)
+    
+    # Save original image individually
+    plt.figure(figsize=(10, 10))
+    plt.imshow(rgb_img)
+    plt.axis('off')
+    plt.tight_layout(pad=0)
+    plt.savefig(os.path.join(individual_dir, 'original.png'), dpi=150, bbox_inches='tight', pad_inches=0)
+    plt.close()
+    
+    # Prepare CAM overlays and save individually
+    branch_names = ['PFE High-Freq', 'PFE Low-Freq', 'SFE Semantic', 'Fused']
+    branch_keys = ['pfe_high', 'pfe_low', 'sfe', 'fused']
+    file_suffixes = ['pfe_high', 'pfe_low', 'sfe', 'fused']
+    
+    cam_overlays = {}
+    for name, key, suffix in zip(branch_names, branch_keys, file_suffixes):
+        cam = cams[key]
+        # Resize CAM to match image size
+        cam_resized = cv2.resize(cam, (rgb_img.shape[1], rgb_img.shape[0]))
+        # Create overlay
+        cam_overlay = show_cam_on_image(rgb_img, cam_resized, use_rgb=True)
+        cam_overlays[key] = cam_overlay
+        
+        # Save individual overlay
+        plt.figure(figsize=(10, 10))
+        plt.imshow(cam_overlay)
+        plt.axis('off')
+        plt.tight_layout(pad=0)
+        plt.savefig(os.path.join(individual_dir, f'{suffix}_overlay.png'), dpi=150, bbox_inches='tight', pad_inches=0)
+        plt.close()
+    
+    # Save raw fused heatmap individually
+    plt.figure(figsize=(10, 10))
+    plt.imshow(cams['fused'], cmap='jet')
+    plt.axis('off')
+    plt.tight_layout(pad=0)
+    plt.savefig(os.path.join(individual_dir, 'fused_heatmap_raw.png'), dpi=150, bbox_inches='tight', pad_inches=0)
+    plt.close()
+    
+    # Now create the subplot grid as before
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    title_text = f'{file_name}\n{category_full}\nPred: {pred_label} ({pred_prob:.3f}) | True: {true_label}'
+    fig.suptitle(title_text, fontsize=14, fontweight='bold')
+    
+    # Original image
+    axes[0, 0].imshow(rgb_img)
+    axes[0, 0].set_title('Original')
+    axes[0, 0].axis('off')
+    
+    # CAM overlays in subplot
+    positions = [(0, 1), (0, 2), (1, 0), (1, 1)]
+    
+    for (row, col), name, key in zip(positions, branch_names, branch_keys):
+        axes[row, col].imshow(cam_overlays[key])
+        axes[row, col].set_title(name)
+        axes[row, col].axis('off')
+    
+    # Raw fused heatmap in subplot
+    axes[1, 2].imshow(cams['fused'], cmap='jet')
+    axes[1, 2].set_title('Fused Heatmap (raw)')
+    axes[1, 2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{file_name}_cam.png'), dpi=150, bbox_inches='tight')
+    plt.close()
 # def save_cam_visualization(rgb_image, cams, file_name, output_dir, pred_prob, true_label, pred_label):
 #     """
 #     Save CAM visualizations as a grid without pytorch_grad_cam dependency
@@ -105,63 +198,63 @@ import os
 #     plt.savefig(os.path.join(output_dir, f'{safe_filename}_cam.png'), dpi=150, bbox_inches='tight')
 #     plt.close()
 
-def save_cam_visualization(rgb_image, cams, file_name, output_dir, pred_prob, true_label, pred_label):
-    """
-    Save CAM visualizations as a grid
-    Args:
-        rgb_image: [3, H, W] tensor
-        cams: dict of {branch: heatmap [H, W]}
-        file_name: str (now includes category prefix like "TP_", "FP_", etc.)
-        output_dir: str
-        pred_prob: float
-        true_label: int
-        pred_label: int
-    """
-    # Determine category from filename for title
-    category = file_name.split('_')[0] if file_name.startswith(('TP', 'TN', 'FP', 'FN')) else ''
-    category_full = {
-        'TP': 'True Positive',
-        'TN': 'True Negative', 
-        'FP': 'False Positive',
-        'FN': 'False Negative'
-    }.get(category, '')
+# def save_cam_visualization(rgb_image, cams, file_name, output_dir, pred_prob, true_label, pred_label):
+#     """
+#     Save CAM visualizations as a grid
+#     Args:
+#         rgb_image: [3, H, W] tensor
+#         cams: dict of {branch: heatmap [H, W]}
+#         file_name: str (now includes category prefix like "TP_", "FP_", etc.)
+#         output_dir: str
+#         pred_prob: float
+#         true_label: int
+#         pred_label: int
+#     """
+#     # Determine category from filename for title
+#     category = file_name.split('_')[0] if file_name.startswith(('TP', 'TN', 'FP', 'FN')) else ''
+#     category_full = {
+#         'TP': 'True Positive',
+#         'TN': 'True Negative', 
+#         'FP': 'False Positive',
+#         'FN': 'False Negative'
+#     }.get(category, '')
     
-    # Convert RGB image to numpy [H, W, 3] in range [0, 1]
-    rgb_img = rgb_image.permute(1, 2, 0).cpu().numpy()
-    rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-8)
+#     # Convert RGB image to numpy [H, W, 3] in range [0, 1]
+#     rgb_img = rgb_image.permute(1, 2, 0).cpu().numpy()
+#     rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-8)
     
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    title_text = f'{file_name}\n{category_full}\nPred: {pred_label} ({pred_prob:.3f}) | True: {true_label}'
-    fig.suptitle(title_text, fontsize=14, fontweight='bold')
+#     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+#     title_text = f'{file_name}\n{category_full}\nPred: {pred_label} ({pred_prob:.3f}) | True: {true_label}'
+#     fig.suptitle(title_text, fontsize=14, fontweight='bold')
     
-    # Original image
-    axes[0, 0].imshow(rgb_img)
-    axes[0, 0].set_title('Original')
-    axes[0, 0].axis('off')
+#     # Original image
+#     axes[0, 0].imshow(rgb_img)
+#     axes[0, 0].set_title('Original')
+#     axes[0, 0].axis('off')
     
-    # CAM overlays
-    branch_names = ['PFE High-Freq', 'PFE Low-Freq', 'SFE Semantic', 'Fused']
-    branch_keys = ['pfe_high', 'pfe_low', 'sfe', 'fused']
-    positions = [(0, 1), (0, 2), (1, 0), (1, 1)]
+#     # CAM overlays
+#     branch_names = ['PFE High-Freq', 'PFE Low-Freq', 'SFE Semantic', 'Fused']
+#     branch_keys = ['pfe_high', 'pfe_low', 'sfe', 'fused']
+#     positions = [(0, 1), (0, 2), (1, 0), (1, 1)]
     
-    for (row, col), name, key in zip(positions, branch_names, branch_keys):
-        cam = cams[key]
-        # Resize CAM to match image size
-        cam_resized = cv2.resize(cam, (rgb_img.shape[1], rgb_img.shape[0]))
-        # Create overlay
-        cam_overlay = show_cam_on_image(rgb_img, cam_resized, use_rgb=True)
-        axes[row, col].imshow(cam_overlay)
-        axes[row, col].set_title(name)
-        axes[row, col].axis('off')
+#     for (row, col), name, key in zip(positions, branch_names, branch_keys):
+#         cam = cams[key]
+#         # Resize CAM to match image size
+#         cam_resized = cv2.resize(cam, (rgb_img.shape[1], rgb_img.shape[0]))
+#         # Create overlay
+#         cam_overlay = show_cam_on_image(rgb_img, cam_resized, use_rgb=True)
+#         axes[row, col].imshow(cam_overlay)
+#         axes[row, col].set_title(name)
+#         axes[row, col].axis('off')
     
-    # Raw fused heatmap
-    axes[1, 2].imshow(cams['fused'], cmap='jet')
-    axes[1, 2].set_title('Fused Heatmap (raw)')
-    axes[1, 2].axis('off')
+#     # Raw fused heatmap
+#     axes[1, 2].imshow(cams['fused'], cmap='jet')
+#     axes[1, 2].set_title('Fused Heatmap (raw)')
+#     axes[1, 2].axis('off')
     
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'{file_name}_cam.png'), dpi=150, bbox_inches='tight')
-    plt.close()
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(output_dir, f'{file_name}_cam.png'), dpi=150, bbox_inches='tight')
+#     plt.close()
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
