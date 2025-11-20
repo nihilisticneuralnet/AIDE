@@ -1156,7 +1156,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 #     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true, cam_results
 
 def evaluate(data_loader, model, device, use_amp=False, distributed=False,
-             generate_cams=False, cam_output_dir=None, num_cam_samples=100):
+             generate_cams=False, cam_output_dir=None, num_cam_samples=500):
     """
     Evaluate model + optionally generate GradCAM++.
     Correct label mapping:
