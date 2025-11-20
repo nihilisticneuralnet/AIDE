@@ -231,7 +231,7 @@ def get_args_parser():
                         help='Generate Grad-CAM++ visualizations during evaluation')
     parser.add_argument('--cam_output_dir', default=None, type=str,
                         help='Directory to save CAM visualizations')
-    parser.add_argument('--num_cam_samples', default=100, type=int,
+    parser.add_argument('--num_cam_samples', default=500, type=int,
                         help='Number of samples to generate CAMs for')
     return parser
 
