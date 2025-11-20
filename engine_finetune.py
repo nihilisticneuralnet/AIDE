@@ -854,14 +854,162 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 
-@torch.no_grad()
+# @torch.no_grad()
+# def evaluate(data_loader, model, device, use_amp=False, distributed=False,
+#              generate_cams=False, cam_output_dir=None, num_cam_samples=100):
+#     """
+#     Evaluate the model and optionally generate Grad-CAM++ visualizations.
+#     Gradients are only enabled for CAM generation; metrics are computed with torch.no_grad().
+#     """
+#     import os
+
+#     criterion = torch.nn.CrossEntropyLoss()
+#     metric_logger = utils.MetricLogger(delimiter="  ")
+#     header = 'Test:'
+
+#     model.eval()
+#     predictions, labels = [], []
+
+#     # ------------------------
+#     # 1. Normal evaluation
+#     # ------------------------
+#     for index, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
+#         images = batch[0].to(device, non_blocking=True)
+#         target = batch[-1].to(device, non_blocking=True)
+
+#         # Forward pass
+#         if use_amp:
+#             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+#                 output = model(images)
+#         else:
+#             output = model(images)
+
+#         if isinstance(output, dict):
+#             output = output['logits']
+
+#         loss = criterion(output, target)
+
+#         # Collect predictions and labels
+#         predictions.append(output)
+#         labels.append(target)
+
+#         torch.cuda.synchronize()
+#         acc1, acc5 = accuracy(output, target, topk=(1, 2))
+#         batch_size = images.shape[0]
+#         metric_logger.update(loss=loss.item())
+#         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+#         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+
+#     predictions = torch.cat(predictions, dim=0)
+#     labels = torch.cat(labels, dim=0)
+
+#     # Distributed gather if needed
+#     if distributed and utils.is_dist_avail_and_initialized():
+#         output_ddp = [torch.zeros_like(predictions) for _ in range(utils.get_world_size())]
+#         dist.all_gather(output_ddp, predictions)
+#         labels_ddp = [torch.zeros_like(labels) for _ in range(utils.get_world_size())]
+#         dist.all_gather(labels_ddp, labels)
+
+#         output_all = torch.cat(output_ddp, dim=0)
+#         labels_all = torch.cat(labels_ddp, dim=0)
+#     else:
+#         output_all = predictions
+#         labels_all = labels
+
+#     # Convert to numpy for metrics
+#     y_pred = softmax(output_all.detach().cpu().numpy(), axis=1)[:, 1]
+#     y_true = labels_all.detach().cpu().numpy().astype(int)
+#     acc = accuracy_score(y_true, y_pred > 0.5)
+#     ap = average_precision_score(y_true, y_pred)
+
+#     cam_results = None
+
+#     # ------------------------
+#     # 2. Grad-CAM++ generation
+#     # ------------------------
+#     if generate_cams and cam_output_dir is not None:
+#         os.makedirs(cam_output_dir, exist_ok=True)
+#         cam_results = {'pfe_high': [], 'pfe_low': [], 'sfe': [], 'fused': []}
+#         cam_counts = {'TP':0,'TN':0,'FP':0,'FN':0}
+#         samples_per_category = num_cam_samples // 4
+#         total_cam_count = 0
+    
+#         model.eval()
+#         torch.set_grad_enabled(True)
+    
+#         for batch in data_loader:
+#             if total_cam_count >= num_cam_samples:
+#                 break
+    
+#             images = batch[0].to(device)
+#             target = batch[-1].to(device)
+#             file_names = batch[2] if len(batch) > 2 else None
+#             batch_size = images.shape[0]
+    
+#             for i in range(batch_size):
+#                 if total_cam_count >= num_cam_samples:
+#                     break
+    
+#                 single_image = images[i:i+1]
+#                 single_target = int(target[i].item())
+    
+#                 logits = model(single_image)
+#                 pred_class = logits.argmax(dim=1).item()
+#                 pred_prob = torch.softmax(logits, dim=1)[0,1].item()
+    
+#                 # Determine category
+#                 if single_target==1 and pred_class==1: category='TP'
+#                 elif single_target==0 and pred_class==0: category='TN'
+#                 elif single_target==0 and pred_class==1: category='FP'
+#                 elif single_target==1 and pred_class==0: category='FN'
+    
+#                 if cam_counts[category]>=samples_per_category:
+#                     continue
+    
+#                 # Generate CAMs — single_target as int
+#                 cams = model.module.generate_gradcam(single_image, target_class=single_target) \
+#                     if hasattr(model,'module') else model.generate_gradcam(single_image, target_class=single_target)
+    
+#                 fused_cam = np.mean([cams['pfe_high'], cams['pfe_low'], cams['sfe']], axis=0)
+#                 cams['fused'] = fused_cam
+    
+#                 for branch in ['pfe_high','pfe_low','sfe','fused']:
+#                     cam_results[branch].append(cams[branch])
+    
+#                 file_name = file_names[i] if file_names else f"sample_{total_cam_count}"
+#                 save_cam_visualization(
+#                     single_image[0,4].cpu(),
+#                     cams,
+#                     f"{category}_{file_name}",
+#                     cam_output_dir,
+#                     pred_prob,
+#                     single_target,
+#                     pred_class
+#                 )
+    
+#                 cam_counts[category]+=1
+#                 total_cam_count+=1
+    
+#         torch.set_grad_enabled(False)
+
+#         print(f"✅ Generated {total_cam_count} Grad-CAM++ visualizations in {cam_output_dir}")
+#         print(f"TP: {cam_counts['TP']}, TN: {cam_counts['TN']}, FP: {cam_counts['FP']}, FN: {cam_counts['FN']}")
+
+#     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true, cam_results
+
+
+
+
 def evaluate(data_loader, model, device, use_amp=False, distributed=False,
              generate_cams=False, cam_output_dir=None, num_cam_samples=100):
     """
-    Evaluate the model and optionally generate Grad-CAM++ visualizations.
-    Gradients are only enabled for CAM generation; metrics are computed with torch.no_grad().
+    Evaluate model (metrics) and optionally generate Grad-CAM++ visualizations.
+    - Metrics are computed under torch.no_grad() for speed and memory.
+    - CAM generation is performed inside a `with torch.enable_grad()` context and uses the model.generate_gradcam method.
     """
     import os
+    from sklearn.metrics import accuracy_score, average_precision_score
+    from scipy.special import softmax
 
     criterion = torch.nn.CrossEntropyLoss()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -870,40 +1018,37 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
     model.eval()
     predictions, labels = [], []
 
-    # ------------------------
-    # 1. Normal evaluation
-    # ------------------------
-    for index, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
-        images = batch[0].to(device, non_blocking=True)
-        target = batch[-1].to(device, non_blocking=True)
+    # 1) Normal evaluation (no gradients)
+    with torch.no_grad():
+        for index, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
+            images = batch[0].to(device, non_blocking=True)
+            target = batch[-1].to(device, non_blocking=True)
 
-        # Forward pass
-        if use_amp:
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            if use_amp:
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    output = model(images)
+            else:
                 output = model(images)
-        else:
-            output = model(images)
 
-        if isinstance(output, dict):
-            output = output['logits']
+            if isinstance(output, dict):
+                output = output['logits']
 
-        loss = criterion(output, target)
+            loss = criterion(output, target)
 
-        # Collect predictions and labels
-        predictions.append(output)
-        labels.append(target)
+            predictions.append(output.detach())
+            labels.append(target.detach())
 
-        torch.cuda.synchronize()
-        acc1, acc5 = accuracy(output, target, topk=(1, 2))
-        batch_size = images.shape[0]
-        metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+            torch.cuda.synchronize()
+            acc1, acc5 = accuracy(output, target, topk=(1, 2))
+            batch_size = images.shape[0]
+            metric_logger.update(loss=loss.item())
+            metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+            metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
 
     predictions = torch.cat(predictions, dim=0)
     labels = torch.cat(labels, dim=0)
 
-    # Distributed gather if needed
+    # distributed gather if needed
     if distributed and utils.is_dist_avail_and_initialized():
         output_ddp = [torch.zeros_like(predictions) for _ in range(utils.get_world_size())]
         dist.all_gather(output_ddp, predictions)
@@ -916,7 +1061,7 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
         output_all = predictions
         labels_all = labels
 
-    # Convert to numpy for metrics
+    # convert for metrics
     y_pred = softmax(output_all.detach().cpu().numpy(), axis=1)[:, 1]
     y_true = labels_all.detach().cpu().numpy().astype(int)
     acc = accuracy_score(y_true, y_pred > 0.5)
@@ -924,61 +1069,76 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
 
     cam_results = None
 
-    # ------------------------
-    # 2. Grad-CAM++ generation
-    # ------------------------
+    # 2) Grad-CAM++ generation (enable grad only for this block)
     if generate_cams and cam_output_dir is not None:
         os.makedirs(cam_output_dir, exist_ok=True)
         cam_results = {'pfe_high': [], 'pfe_low': [], 'sfe': [], 'fused': []}
         cam_counts = {'TP':0,'TN':0,'FP':0,'FN':0}
-        samples_per_category = num_cam_samples // 4
+        samples_per_category = max(1, num_cam_samples // 4)
         total_cam_count = 0
-    
+
         model.eval()
-        torch.set_grad_enabled(True)
-    
+        # enable grad only in this block
         for batch in data_loader:
             if total_cam_count >= num_cam_samples:
                 break
-    
+
             images = batch[0].to(device)
             target = batch[-1].to(device)
             file_names = batch[2] if len(batch) > 2 else None
             batch_size = images.shape[0]
-    
+
             for i in range(batch_size):
                 if total_cam_count >= num_cam_samples:
                     break
-    
-                single_image = images[i:i+1]
+
+                single_image = images[i:i+1]  # [1,5,3,H,W]
                 single_target = int(target[i].item())
-    
-                logits = model(single_image)
+
+                # forward to get logits (no grad needed)
+                with torch.no_grad():
+                    logits = model(single_image)
                 pred_class = logits.argmax(dim=1).item()
                 pred_prob = torch.softmax(logits, dim=1)[0,1].item()
-    
-                # Determine category
-                if single_target==1 and pred_class==1: category='TP'
-                elif single_target==0 and pred_class==0: category='TN'
-                elif single_target==0 and pred_class==1: category='FP'
-                elif single_target==1 and pred_class==0: category='FN'
-    
-                if cam_counts[category]>=samples_per_category:
+
+                # determine TP/TN/FP/FN
+                if single_target==1 and pred_class==1:
+                    category='TP'
+                elif single_target==0 and pred_class==0:
+                    category='TN'
+                elif single_target==0 and pred_class==1:
+                    category='FP'
+                else:
+                    category='FN'
+
+                if cam_counts[category] >= samples_per_category:
                     continue
-    
-                # Generate CAMs — single_target as int
-                cams = model.module.generate_gradcam(single_image, target_class=single_target) \
-                    if hasattr(model,'module') else model.generate_gradcam(single_image, target_class=single_target)
-    
+
+                # Now compute CAMs with gradients enabled for this single sample
+                # ensure DataParallel handled
+                gen_fn = model.module.generate_gradcam if hasattr(model, 'module') else model.generate_gradcam
+
+                try:
+                    # call generate_gradcam inside grad-enabled context
+                    with torch.enable_grad():
+                        cams = gen_fn(single_image, target_class=single_target,
+                                      branches=['pfe_high','pfe_low','sfe'])
+                except Exception as e:
+                    print(f"[evaluate] generate_gradcam failed for sample {i}: {e}")
+                    # fallback zero maps
+                    h, w = single_image.shape[-2], single_image.shape[-1]
+                    cams = {'pfe_high': np.zeros((h,w)), 'pfe_low': np.zeros((h,w)), 'sfe': np.zeros((h,w))}
+
                 fused_cam = np.mean([cams['pfe_high'], cams['pfe_low'], cams['sfe']], axis=0)
                 cams['fused'] = fused_cam
-    
+
+                # store and save visualizations
                 for branch in ['pfe_high','pfe_low','sfe','fused']:
                     cam_results[branch].append(cams[branch])
-    
+
                 file_name = file_names[i] if file_names else f"sample_{total_cam_count}"
                 save_cam_visualization(
-                    single_image[0,4].cpu(),
+                    single_image[0,4].cpu(),  # semantic 'tokens' frame for overlay
                     cams,
                     f"{category}_{file_name}",
                     cam_output_dir,
@@ -986,13 +1146,12 @@ def evaluate(data_loader, model, device, use_amp=False, distributed=False,
                     single_target,
                     pred_class
                 )
-    
-                cam_counts[category]+=1
-                total_cam_count+=1
-    
-        torch.set_grad_enabled(False)
+
+                cam_counts[category] += 1
+                total_cam_count += 1
 
         print(f"✅ Generated {total_cam_count} Grad-CAM++ visualizations in {cam_output_dir}")
         print(f"TP: {cam_counts['TP']}, TN: {cam_counts['TN']}, FP: {cam_counts['FP']}, FN: {cam_counts['FN']}")
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, acc, ap, y_pred, y_true, cam_results
+
