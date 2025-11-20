@@ -357,8 +357,25 @@ class AIDE_Model(nn.Module):
         device = next(self.parameters()).device
         cams = {}
         
-        # mapping branch -> slice index within the 5-frame input
-        branch_to_index = {'pfe_low': 0, 'pfe_high': 1, 'sfe': 4}
+        # Extended mapping: support both individual slices and grouped channels
+        branch_config = {
+            'pfe_low': {
+                'input_slices': [0],  # minmin only
+                'target_layer': lambda: self.model_min.layer4[-1]
+            },
+            'pfe_high': {
+                'input_slices': [1],  # maxmax only
+                'target_layer': lambda: self.model_max.layer4[-1]
+            },
+            'pfe': {
+                'input_slices': [0, 1, 2, 3],  # all PFE inputs combined
+                'target_layer': lambda: self.model_max.layer4[-1]  # use max as representative
+            },
+            'sfe': {
+                'input_slices': [4],  # semantic input
+                'target_layer': lambda: self.openclip_convnext_xxl.stages[-1]
+            }
+        }
         
         # helper to temporarily unfreeze/freeze convnext params
         def _set_convnext_requires_grad(flag):
@@ -368,11 +385,12 @@ class AIDE_Model(nn.Module):
         
         # For each branch, run forward with gradients enabled
         for branch in branches:
-            if branch not in branch_to_index:
+            if branch not in branch_config:
                 cams[branch] = None
                 continue
             
-            target_idx = branch_to_index[branch]
+            config = branch_config[branch]
+            input_slices = config['input_slices']
             activations = []
             
             def forward_hook(module, input, output):
@@ -380,38 +398,35 @@ class AIDE_Model(nn.Module):
                 activations.append(output)
             
             # get target layer/module for hook
-            target_layers = self.get_target_layers(branch)
-            hook_module = target_layers[0]
+            hook_module = config['target_layer']()
             
             # register forward hook
             handle = hook_module.register_forward_hook(forward_hook)
             
             try:
-                # Prepare input - only the specific branch slice needs grad
+                # Prepare input - only the specific branch slice(s) need grad
                 x = input_tensor.clone().to(device)
                 x.requires_grad_(False)  # Disable grad for all slices initially
                 
-                # Enable grad only for the target branch slice
-                branch_slice = x[:, target_idx].clone().requires_grad_(True)
-                
-                # Replace the slice (avoid in-place operation issues)
+                # Enable grad for relevant slices for this branch
                 x_list = []
                 for i in range(x.shape[1]):
-                    if i == target_idx:
-                        x_list.append(branch_slice.unsqueeze(1))
+                    if i in input_slices:
+                        slice_grad = x[:, i].clone().requires_grad_(True)
+                        x_list.append(slice_grad.unsqueeze(1))
                     else:
                         x_list.append(x[:, i:i+1])
                 x = torch.cat(x_list, dim=1)
                 
                 # if SFE branch, convnext parameters were frozen at model init; enable grads temporarily
                 convnext_was_frozen = False
-                if branch == 'sfe':
+                if 'sfe' in branch:
                     _set_convnext_requires_grad(True)
                     convnext_was_frozen = True
                 
                 # enable grad context for CAM computation
                 with torch.enable_grad():
-                    # CRITICAL FIX: No masking - use full model as it was trained
+                    # No masking - use full model as it was trained
                     logits = self.forward(x)
                     
                     # ensure logits shape ok: [B, num_classes]
@@ -526,6 +541,7 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
 
