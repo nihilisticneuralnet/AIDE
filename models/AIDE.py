@@ -336,20 +336,15 @@ class AIDE_Model(nn.Module):
 
 
     def generate_gradcam(self, input_tensor, target_class=None, branches=['pfe_high', 'pfe_low', 'sfe']):
-        """
-        Grad-CAM++ generator per-branch. Expects:
-          - input_tensor on CPU or same device as model (will be moved to device)
-          - self.get_target_layers(branch) returns a list where [0] is an nn.Module to hook
-          - self.forward(x, branch_mask=mask) accepts branch_mask if you use it (optional)
-        """
         self.eval()
-    
-        # --- unify target_class into list ---
+        
+        # unify target_class into list for indexing
         if target_class is None:
+            # run a quick forward to get predicted class for single-sample inputs
             with torch.no_grad():
-                logits = self.forward(input_tensor.to(next(self.parameters()).device))
+                logits = self.forward(input_tensor)
                 target_class = logits.argmax(dim=1).item()
-    
+        
         if isinstance(target_class, int):
             target_classes = [target_class]
         elif isinstance(target_class, torch.Tensor):
@@ -358,148 +353,135 @@ class AIDE_Model(nn.Module):
             target_classes = target_class
         else:
             raise ValueError(f"Invalid target_class type: {type(target_class)}")
-    
+        
         device = next(self.parameters()).device
         cams = {}
-    
-        # mapping branch -> slice index within the T-frame input (adjust if your temporal dim differs)
+        
+        # mapping branch -> slice index within the 5-frame input
         branch_to_index = {'pfe_low': 0, 'pfe_high': 1, 'sfe': 4}
-    
+        
+        # helper to temporarily unfreeze/freeze convnext params
         def _set_convnext_requires_grad(flag):
             if hasattr(self, "openclip_convnext_xxl") and self.openclip_convnext_xxl is not None:
                 for p in self.openclip_convnext_xxl.parameters():
                     p.requires_grad = flag
-    
+        
+        # For each branch, run forward with gradients enabled
         for branch in branches:
             if branch not in branch_to_index:
                 cams[branch] = None
                 continue
-    
+            
             target_idx = branch_to_index[branch]
             activations = []
-    
-            # branch isolation mask for forward - used in your forward optionally
-            if 'pfe' in branch:
-                mask = {'pfe': 1.0, 'sfe': 0.0}
-            elif branch == 'sfe':
-                mask = {'pfe': 0.0, 'sfe': 1.0}
-            else:
-                raise ValueError(f"Unknown branch: {branch}")
-    
+            
             def forward_hook(module, input, output):
-                # capture activation tensor (module output)
+                # capture activation tensor
                 activations.append(output)
-    
-            # get hook module
+            
+            # get target layer/module for hook
             target_layers = self.get_target_layers(branch)
-            if not isinstance(target_layers, (list, tuple)) or len(target_layers) == 0:
-                raise RuntimeError(f"get_target_layers returned unexpected value for branch {branch}: {target_layers}")
             hook_module = target_layers[0]
+            
+            # register forward hook
             handle = hook_module.register_forward_hook(forward_hook)
-    
+            
             try:
-                # Prepare input preserving computational graph
-                # Assumes input_tensor shape is [B, T, C, H, W] (if different, adjust accordingly)
+                # Prepare input - only the specific branch slice needs grad
                 x = input_tensor.clone().to(device)
-                # make x require grad so gradients flow to intermediate activations
-                x.requires_grad_(True)
-    
-                # Build a mask that keeps only target slice and zeros-out others while preserving graph
-                # This avoids detach/replace which breaks autograd path
-                # Create a mask of same shape as x with zeros except 1 at target index
-                # We try to handle both [B, T, C, H, W] and [B, C, H, W] cases:
-                if x.dim() == 5:
-                    B, T, C, H, W = x.shape
-                    if target_idx < 0 or target_idx >= T:
-                        raise IndexError(f"target_idx {target_idx} out of range for temporal length {T}")
-                    mask_tensor = torch.zeros_like(x, device=device)
-                    mask_tensor[:, target_idx] = 1.0
-                elif x.dim() == 4:
-                    # if no temporal dim, treat target_idx as channel-grouping index not supported here
-                    # fallback: use full input (no masking)
-                    mask_tensor = torch.ones_like(x, device=device)
-                else:
-                    raise RuntimeError(f"Unsupported input tensor dimensionality: {x.dim()}")
-    
-                # masked input preserves graph (keeps other frames zeroed but connected)
-                x_masked = x * mask_tensor
-    
+                x.requires_grad_(False)  # Disable grad for all slices initially
+                
+                # Enable grad only for the target branch slice
+                branch_slice = x[:, target_idx].clone().requires_grad_(True)
+                
+                # Replace the slice (avoid in-place operation issues)
+                x_list = []
+                for i in range(x.shape[1]):
+                    if i == target_idx:
+                        x_list.append(branch_slice.unsqueeze(1))
+                    else:
+                        x_list.append(x[:, i:i+1])
+                x = torch.cat(x_list, dim=1)
+                
+                # if SFE branch, convnext parameters were frozen at model init; enable grads temporarily
                 convnext_was_frozen = False
                 if branch == 'sfe':
-                    # temporarily enable convnext grads if they were frozen
                     _set_convnext_requires_grad(True)
                     convnext_was_frozen = True
-    
+                
+                # enable grad context for CAM computation
                 with torch.enable_grad():
-                    logits = self.forward(x_masked, branch_mask=mask) if 'branch_mask' in self.forward.__code__.co_varnames else self.forward(x_masked)
+                    # CRITICAL FIX: No masking - use full model as it was trained
+                    logits = self.forward(x)
+                    
+                    # ensure logits shape ok: [B, num_classes]
                     if logits is None:
                         raise RuntimeError("Model forward returned None logits during CAM generation")
-    
-                    # safer aggregation: sum the scores for chosen target class across batch (works any batch size)
-                    # pick the first target class in target_classes list
-                    cls = target_classes[0]
-                    # ensure logits shape is [B, num_classes]
-                    if logits.dim() == 1:
-                        # single-class logit vector (rare), convert to shape [1]
-                        score = logits if logits.shape[0] == 1 else logits.sum()
-                    else:
-                        score = logits[:, cls].sum()
-    
-                    # ensure activation captured
+                    
+                    score = logits[:, target_classes[0]]  # shape [B]
+                    
+                    # ensure we have the activation recorded
                     if len(activations) == 0:
-                        raise RuntimeError(f"No activations captured for branch {branch}; check hook target layer")
-    
-                    act = activations[0]  # expected shape [B, C, H, W]
-                    # retain grad on activation to inspect grads after backward
+                        raise RuntimeError(f"No activations captured for branch {branch}; check hook target")
+                    
+                    act = activations[0]  # tensor [B, C, H, W]
+                    
+                    # retain grad for activation
                     act.retain_grad()
-    
+                    
                     # zero grads
                     self.zero_grad()
-                    # backprop the scalar score
-                    score.backward(retain_graph=True)
-    
-                    # check grad presence
-                    if act.grad is None:
-                        raise RuntimeError(f"Activation gradient is None for branch {branch}; autograd graph likely broken")
-    
+                    
+                    # backprop scalar score
+                    score_to_backprop = score[0] if score.shape[0] > 0 else score
+                    score_to_backprop.backward(retain_graph=False)
+                    
+                    # --- Grad-CAM++ calculation ---
                     grads = act.grad  # [B, C, H, W]
                     feature_map = act.detach()
-    
-                    # Grad-CAM++ computations (your existing formula)
+                    
+                    if grads is None:
+                        raise RuntimeError(f"Gradients for activations are None for branch {branch}")
+                    
                     grads_power_2 = grads.pow(2)
                     grads_power_3 = grads.pow(3)
+                    
+                    # Calculate spatial sum and alpha
                     spatial_sum = (feature_map * grads_power_3).sum(dim=(2, 3), keepdim=True)  # [B, C, 1, 1]
                     denom = 2 * grads_power_2 + spatial_sum + 1e-8
                     alpha = grads_power_2 / denom  # [B, C, H, W]
+                    
+                    # Calculate weights (L_k^c) and final CAM
                     weights = (alpha * torch.relu(grads)).sum(dim=(2, 3), keepdim=True)  # [B, C, 1, 1]
-                    cam = torch.relu((weights * feature_map).sum(dim=1, keepdim=True))  # [B,1,H,W]
-    
+                    
+                    # weighted combination
+                    cam = torch.relu((weights * feature_map).sum(dim=1, keepdim=True))  # [B, 1, H, W]
+                    
                     # normalize per-sample
-                    cam_min = cam.view(cam.shape[0], -1).min(dim=1)[0].view(-1, 1, 1, 1)
-                    cam = cam - cam_min
-                    cam_max = cam.view(cam.shape[0], -1).max(dim=1)[0].view(-1, 1, 1, 1)
-                    cam = cam / (cam_max + 1e-8)
-    
-                    # upsample to input image HxW
-                    if x.dim() == 5:
-                        H_in, W_in = x.shape[-2], x.shape[-1]
-                    else:
-                        H_in, W_in = input_tensor.shape[-2], input_tensor.shape[-1]
-    
-                    cam_up = F.interpolate(cam, size=(H_in, W_in), mode='bilinear', align_corners=False)
+                    cam = cam - cam.view(cam.shape[0], -1).min(dim=1)[0].view(-1, 1, 1, 1)
+                    cam = cam / (cam.view(cam.shape[0], -1).max(dim=1)[0].view(-1, 1, 1, 1) + 1e-8)
+                    
+                    # upsample to input spatial resolution
+                    H_in, W_in = input_tensor.shape[-2], input_tensor.shape[-1]
+                    cam_up = torch.nn.functional.interpolate(
+                        cam, size=(H_in, W_in), mode='bilinear', align_corners=False
+                    )
+                    
                     cams[branch] = cam_up[0, 0].detach().cpu().numpy()
-    
+                
                 # restore convnext freeze state
                 if convnext_was_frozen:
                     _set_convnext_requires_grad(False)
-    
+            
             except Exception as e:
+                # safe fallback
                 h, w = input_tensor.shape[-2], input_tensor.shape[-1]
                 print(f"[generate_gradcam] Error for branch {branch}: {e}")
                 cams[branch] = np.zeros((h, w))
+            
             finally:
                 handle.remove()
-    
+        
         return cams
 
 
@@ -544,6 +526,7 @@ class AIDE_Model(nn.Module):
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
     return model
+
 
 
 
